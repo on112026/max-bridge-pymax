@@ -1,0 +1,55 @@
+name: max-bridge-pymax
+
+# docker compose для max-bridge-pymax (этап 2).
+# Один сервис, в нём через supervisord крутятся 3 процесса: api, bot, max.
+#
+# Поднять:
+#   cp .env.example .env   # и заполнить токены
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Данные хранятся в /data (том bridge_data), кэш PyMax — в cache (том bridge_cache).
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: max-bridge-pymax:stage2
+    container_name: max-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Внутри контейнера API крутится на 127.0.0.1:8000, но supervisord уже
+      # стартует все 3 процесса в одном namespace, поэтому каждый из них ходит
+      # на localhost. На всякий случай фиксируем явно:
+      API_HOST: 0.0.0.0
+      API_BASE_URL: http://127.0.0.1:${API_PORT:-8000}
+      DB_PATH: /data/bridge.db
+      MEDIA_DIR: /data/media
+      CACHE_DIR: /app/cache
+      PYTHONUNBUFFERED: "1"
+    ports:
+      # API наружу можно не пробрасывать, если бот/мост работают в одной сети.
+      # Пробрасываем для удобства отладки (`curl localhost:8000/status`).
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - bridge_data:/data
+      - bridge_cache:/app/cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  bridge_data:
+  bridge_cache:

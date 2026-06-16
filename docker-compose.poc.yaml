@@ -1,0 +1,28 @@
+# Минимальный docker-compose для PoC.
+#
+# Запуск:
+#   cd max-bridge-pymax
+#   cp .envOLD.example .envOLD  # заполните MAX_PHONE
+#   docker compose -f docker-compose.poc.yaml run --rm poc
+#
+# ВАЖНО: используется `run` (а не `up`), чтобы:
+#   - не было фонового процесса;
+#   - легко прерывать по Ctrl+C;
+#   - видеть SMS/2FA prompt в текущем TTY.
+
+services:
+  poc:
+    build:
+      context: .
+      dockerfile: Dockerfile.poc
+    image: max-bridge-pymax:poc
+    environment:
+      MAX_PHONE: ${MAX_PHONE:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Сессия PyMax сохраняется между перезапусками.
+      - ./cache:/app/cache
+      # .envOLD подхватывается, но MAX_PHONE уже проброшен через environment.
+      - ./.envOLD:/app/.envOLD:ro
+    stdin_open: true   # держим STDIN открытым для SMS/2FA prompt
+    tty: true

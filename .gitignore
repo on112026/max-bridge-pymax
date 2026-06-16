@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Кэш и сессии PyMax
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# ENV
+.envOLD
+.env.local

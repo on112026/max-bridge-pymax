@@ -1,0 +1,15 @@
+# Зависимости max-bridge-pymax.
+# PyMax вендорится в ./vendor/pymax и НЕ ставится из PyPI (см. vendor/README.md).
+
+# --- PyMax runtime deps (из PyMax/pyproject.toml, version 2.2.0) ---
+aiofiles>=25.1.0
+aiohttp>=3.13.5
+aiosqlite>=0.22.1
+msgpack>=1.1.2
+pydantic>=2.10.0
+python-socks[asyncio]>=2.8.1
+qrcode>=8.2
+websockets>=16.0
+
+# --- dotenv loader для run_poc.py ---
+python-dotenv>=1.0.1

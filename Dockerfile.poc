@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+#
+# Минимальный образ для PoC: только PyMax + run_poc.py, никакого бота/api/БД.
+# Размер образа — ~150 МБ.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app:/app/vendor
+
+WORKDIR /app
+
+# 1) Системные зависимости (минимум): только то, что нужно aiohttp/aiosqlite.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2) Python-зависимости (из requirements.txt)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# 3) Вендоренный PyMax (см. vendor/README.md)
+COPY vendor /app/vendor
+
+# 4) Код PoC
+COPY run_poc.py /app/run_poc.py
+
+# 5) Persistent-директория для сессии PyMax (./cache/main.db).
+#    Монтируйте её как volume, чтобы не терять сессию между перезапусками.
+RUN mkdir -p /app/cache
+VOLUME ["/app/cache"]
+
+# Точка входа — интерактивный запуск PoC (нужен -it для ввода SMS/2FA).
+ENTRYPOINT ["python", "run_poc.py"]

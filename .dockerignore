@@ -1,0 +1,23 @@
+# Локальное, чтобы образ не разрастался
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Кэш сессий (volume создаётся в compose, в образ не кладём)
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# ENV
+.envOLD
+.env.local
+
+# Git
+.git/
+.gitignore
+
+# Документация для разработки — в образ не нужна
+docs/
