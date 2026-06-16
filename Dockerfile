@@ -47,6 +47,6 @@ RUN mkdir -p /data/media/inbox /app/cache
 
 EXPOSE 8000
 
-VOLUME ["/data", "/app/cache"]
+# VOLUME ["/data", "/app/cache"]
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
