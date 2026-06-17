@@ -105,9 +105,9 @@ def build_client(phone: str, cache_dir: str) -> Client:
 # и ухода от error.limit.violate.
 NORMAL_POLL_SECONDS = 30.0  # основной интервал между итерациями supervisor'а
 AUTH_FAIL_BACKOFF = 60.0   # пауза после неудачного client.start() (auth/phone/code)
-RATE_LIMIT_BACKOFF = 180.0 # пауза при rate-limit (error.limit.violate)
+RATE_LIMIT_BACKOFF = 600.0 # пауза при rate-limit (error.limit.violate) — 10 минут
 # Минимальный интервал между запросами нового SMS-кода в секундах.
-SMS_RESEND_COOLDOWN = 300.0
+SMS_RESEND_COOLDOWN = 900.0  # 15 минут между попытками завести новый Client
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -147,9 +147,27 @@ async def run() -> None:
     last_reauth_signal: Optional[str] = None  # анти-дубль: реагируем только на СМЕНУ need_2fa
     last_sms_request_at: float = 0.0         # анти-спам: время последнего create_client для need_2fa
     last_start_failed: bool = False          # только что был неудачный start() — нужен backoff
+    rate_limit_until: float = 0.0            # глобальный cooldown: до этого moment не дёргаем api
 
     try:
         while not stop_event.is_set():
+            # 0) Если активен глобальный rate-limit — ждём до его окончания.
+            now = time.monotonic()
+            if rate_limit_until > 0 and now < rate_limit_until:
+                wait = rate_limit_until - now
+                logger.info(
+                    "global rate-limit cooldown active, waiting %.0fs before next iteration",
+                    wait,
+                )
+                await _sleep_with_stop(stop_event, wait)
+                if stop_event.is_set():
+                    break
+            elif rate_limit_until > 0 and now >= rate_limit_until:
+                # cooldown истёк — сбрасываем флаг, чтобы бот узнал о возврате
+                logger.info("rate-limit cooldown elapsed, resuming")
+                rate_limit_until = 0.0
+                await _post_auth_state("unknown", error=None)
+
             # 1) Проверим, не сигналил ли бот reauth
             auth = await _get_auth_state()
             status = auth.get("status") or "unknown"
@@ -227,7 +245,10 @@ async def run() -> None:
                 except Exception as exc:
                     last_start_failed = True
                     # rate-limit — особый случай: даём длинный бэкофф
+                    # и ставим глобальный rate_limit_until, чтобы следующий цикл
+                    # не дёрнул api.oneme.ru снова сразу после sleep'а.
                     if _is_rate_limit_error(exc):
+                        rate_limit_until = time.monotonic() + RATE_LIMIT_BACKOFF
                         logger.warning(
                             "rate-limit hit, backing off %.0fs (err=%s)",
                             RATE_LIMIT_BACKOFF,

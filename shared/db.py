@@ -86,8 +86,9 @@ class AuthState(Base):
 
     __tablename__ = "auth_state"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    status = Column(String, default="unknown", index=True)  # ok, need_2fa, need_reauth, unknown
+    status = Column(String, default="unknown", index=True)  # ok, need_2fa, need_reauth, rate_limited, unknown
     pending_2fa_request_id = Column(Integer, nullable=True)
+    pending_2fa_kind = Column(String, nullable=True)  # "sms" | "password" | None
     last_2fa_request_at = Column(DateTime, nullable=True)
     last_login_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
@@ -337,6 +338,7 @@ def get_auth_state() -> dict:
         return {
             "status": row.status,
             "pending_2fa_request_id": row.pending_2fa_request_id,
+            "pending_2fa_kind": row.pending_2fa_kind,
             "last_2fa_request_at": row.last_2fa_request_at,
             "last_login_at": row.last_login_at,
             "last_error": row.last_error,
@@ -362,7 +364,10 @@ def set_auth_state(
         row.updated_at = datetime.utcnow()
 
 
-def open_2fa_request() -> int:
+def open_2fa_request(kind: str = "sms") -> int:
+    """Создаёт pending-запрос 2FA. ``kind`` — ``"sms"`` или ``"password"``."""
+    if kind not in ("sms", "password"):
+        kind = "sms"
     with session_scope() as s:
         row = s.query(AuthState).first()
         if not row:
@@ -370,6 +375,7 @@ def open_2fa_request() -> int:
             s.add(row)
         row.status = "need_2fa"
         row.pending_2fa_request_id = int(datetime.utcnow().timestamp() * 1000)
+        row.pending_2fa_kind = kind
         row.last_2fa_request_at = datetime.utcnow()
         row.updated_at = datetime.utcnow()
         return row.pending_2fa_request_id
@@ -405,4 +411,5 @@ def clear_2fa_request() -> None:
         if not row:
             return
         row.pending_2fa_request_id = None
+        row.pending_2fa_kind = None
         row.updated_at = datetime.utcnow()

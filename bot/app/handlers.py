@@ -98,9 +98,16 @@ async def status_command(message: types.Message) -> None:
         return
     auth = s.get("auth", {})
     queue = s.get("queue", {})
+    kind_label = {
+        "sms": "SMS-код",
+        "password": "2FA-пароль",
+        None: "—",
+    }.get(auth.get("pending_2fa_kind"), auth.get("pending_2fa_kind") or "—")
     text = (
         f"🔐 MAX auth: <b>{_escape(str(auth.get('status')))}</b>\n"
-        f"   pending_2fa: {auth.get('pending_2fa_request_id') or '—'}\n"
+        f"   pending_2fa: {auth.get('pending_2fa_request_id') or '—'} "
+        f"(тип: {kind_label})\n"
+        f"   last_2fa_at: {auth.get('last_2fa_request_at') or '—'}\n"
         f"   last_login: {auth.get('last_login_at') or '—'}\n"
         f"   error: {_escape(str(auth.get('last_error') or '—'))}\n"
         f"📬 Недоставлено: <b>{s.get('undelivered')}</b>\n"
@@ -442,6 +449,20 @@ class AuthWatcher:
             except Exception as exc:
                 logger.warning("notify uid=%s failed: %s", uid, exc)
 
+    @staticmethod
+    def _prompt_text(kind: str | None) -> str:
+        """Разные подсказки в зависимости от типа запрошенного кода."""
+        if kind == "password":
+            return (
+                "🔐 MAX запросил <b>2FA-пароль</b>.\n"
+                "Пришлите: <code>/code <ваш_пароль></code>"
+            )
+        # по умолчанию — SMS
+        return (
+            "🔐 MAX прислал <b>SMS-код</b>.\n"
+            "Посмотрите SMS на номер MAX и пришлите: <code>/code <число></code>"
+        )
+
     async def _tick(self) -> None:
         try:
             s = await api.status()
@@ -453,29 +474,33 @@ class AuthWatcher:
         auth = s.get("auth") or {}
         status = auth.get("status") or "unknown"
         rid = auth.get("pending_2fa_request_id")
+        kind = auth.get("pending_2fa_kind") or "sms"
+        last_err = (auth.get("last_error") or "").lower()
 
-        # Уведомляем о смене статуса (ok, need_2fa, unknown)
+        # Уведомляем о смене статуса (ok, need_2fa, rate_limited, unknown)
         if status != self._last_known_status:
             self._last_known_status = status
             if status == "ok":
+                self._notified_request_id = None
                 await self._notify_owner("✅ MAX: вход выполнен успешно.")
             elif status == "need_2fa":
-                # не дублируем, если уже уведомили по этому rid
                 if rid and rid != self._notified_request_id:
                     self._notified_request_id = rid
-                    await self._notify_owner(
-                        "🔐 MAX запрашивает код (SMS или 2FA-пароль).\n"
-                        "Пришлите: <code>/code <число></code>"
-                    )
+                    await self._notify_owner(self._prompt_text(kind))
+            elif status == "rate_limited":
+                hint = ""
+                if "limit.violate" in last_err or "rate" in last_err:
+                    hint = " MAX ограничил частоту запросов — попробуем снова через ~10 мин."
+                await self._notify_owner(
+                    "⚠️ MAX временно ограничил авторизацию." + hint +
+                    "\nКак только cooldown пройдёт, я пришлю уведомление."
+                )
             elif status == "unknown":
                 self._notified_request_id = None
         elif status == "need_2fa" and rid and rid != self._notified_request_id:
             # на случай, если status не менялся, но rid новый
             self._notified_request_id = rid
-            await self._notify_owner(
-                "🔐 MAX запрашивает код (SMS или 2FA-пароль).\n"
-                "Пришлите: <code>/code <число></code>"
-            )
+            await self._notify_owner(self._prompt_text(kind))
 
     async def _run(self) -> None:
         logger.info("AuthWatcher started (poll=%.1fs)", self.POLL_INTERVAL)

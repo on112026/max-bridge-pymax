@@ -74,14 +74,14 @@ class QueueSmsCodeProvider:
 
     async def get_code(self, phone: str) -> str:
         # 1) Сообщить api, что нужен SMS — откроется pending 2fa-запрос.
-        data = await _post("/auth/2fa/request")
+        data = await _post("/auth/2fa/request", json={"kind": "sms"})
         rid = data["request_id"]
-        logger.info("requested SMS code rid=%s for phone=%s", rid, phone)
+        logger.info("requested SMS code rid=%s for phone=%s (kind=sms)", rid, phone)
         ev = _register_request(rid)
         try:
             await asyncio.wait_for(ev.wait(), timeout=self.POLL_TIMEOUT)
         except asyncio.TimeoutError:
-            logger.warning("SMS code timeout rid=%s", rid)
+            logger.warning("SMS code timeout rid=%s (timed out after %.0fs)", rid, self.POLL_TIMEOUT)
             raise
 
         # 2) Забрать код из api (он уже удалён из БД после peek)
@@ -102,14 +102,14 @@ class QueuePasswordProvider:
     POLL_INTERVAL = 1.5
 
     async def get_password(self, hint: str | None = None) -> str:
-        data = await _post("/auth/2fa/request")
+        data = await _post("/auth/2fa/request", json={"kind": "password"})
         rid = data["request_id"]
-        logger.info("requested 2FA password rid=%s hint=%s", rid, hint)
+        logger.info("requested 2FA password rid=%s hint=%s (kind=password)", rid, hint)
         ev = _register_request(rid)
         try:
             await asyncio.wait_for(ev.wait(), timeout=self.POLL_TIMEOUT)
         except asyncio.TimeoutError:
-            logger.warning("2FA password timeout rid=%s", rid)
+            logger.warning("2FA password timeout rid=%s (timed out after %.0fs)", rid, self.POLL_TIMEOUT)
             raise
 
         data = await _get(f"/auth/2fa/peek/{rid}")

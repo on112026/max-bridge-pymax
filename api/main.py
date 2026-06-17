@@ -314,15 +314,28 @@ def post_auth_state(body: AuthStateIn) -> OkOut:
     return OkOut(ok=True)
 
 
+class TwoFaRequestIn(BaseModel):
+    kind: str = "sms"  # "sms" | "password"
+
+
 class TwoFaRequestOut(BaseModel):
     request_id: int
+    kind: str
 
 
 @app.post("/auth/2fa/request", response_model=TwoFaRequestOut, dependencies=[Depends(verify_api_key)])
-def post_2fa_request() -> TwoFaRequestOut:
-    """max-процесс вызывает, когда PyMax SmsAuthFlow запросил SMS-код или пароль."""
-    rid = db.open_2fa_request()
-    return TwoFaRequestOut(request_id=rid)
+def post_2fa_request(body: Optional[TwoFaRequestIn] = None) -> TwoFaRequestOut:
+    """max-процесс вызывает, когда PyMax SmsAuthFlow запросил SMS-код или пароль.
+
+    ``kind`` может быть ``"sms"`` (по умолчанию) или ``"password"`` — чтобы
+    Telegram-бот отправлял владельцу разные подсказки.
+    """
+    kind = (body.kind if body else "sms") or "sms"
+    if kind not in ("sms", "password"):
+        kind = "sms"
+    rid = db.open_2fa_request(kind=kind)
+    logger.info("2fa request opened: id=%s kind=%s", rid, kind)
+    return TwoFaRequestOut(request_id=rid, kind=kind)
 
 
 class TwoFaCodeIn(BaseModel):
