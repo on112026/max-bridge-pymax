@@ -12,7 +12,7 @@ cache/
 *.sqlite3
 
 # ENV
-.envOLD
+.env
 .env.local
 
 # Git
