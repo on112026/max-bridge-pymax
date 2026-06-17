@@ -2,7 +2,7 @@
 # PyMax вендорится в ./vendor/pymax и НЕ ставится из PyPI (см. vendor/README.md).
 
 # --- PyMax runtime deps (из PyMax/pyproject.toml, version 2.2.0) ---
-aiofiles>=25.1.0
+aiofiles>=23.2.1,<24.2
 aiohttp==3.10.10
 aiosqlite>=0.22.1
 msgpack>=1.1.2
