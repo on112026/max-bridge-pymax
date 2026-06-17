@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -100,6 +101,36 @@ def build_client(phone: str, cache_dir: str) -> Client:
     return client
 
 
+# Backoff'ы для уменьшения количества запросов к api.oneme.ru
+# и ухода от error.limit.violate.
+NORMAL_POLL_SECONDS = 30.0  # основной интервал между итерациями supervisor'а
+AUTH_FAIL_BACKOFF = 60.0   # пауза после неудачного client.start() (auth/phone/code)
+RATE_LIMIT_BACKOFF = 180.0 # пауза при rate-limit (error.limit.violate)
+# Минимальный интервал между запросами нового SMS-кода в секундах.
+SMS_RESEND_COOLDOWN = 300.0
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Распознаём «error.limit.violate» в тексте исключения."""
+    msg = str(exc).lower()
+    return "limit" in msg or "too many" in msg or "ratelimit" in msg or "429" in msg
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(s in msg for s in ("auth", "phone", "code", "sms", "password"))
+
+
+async def _sleep_with_stop(stop_event: asyncio.Event, seconds: float) -> None:
+    """Спим `seconds`, но выходим раньше, если взведён stop_event."""
+    if seconds <= 0:
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return
+
+
 async def run() -> None:
     """Главный цикл supervisor'а: пересоздаёт Client при необходимости."""
     phone = os.getenv("MAX_PHONE", "")
@@ -114,6 +145,8 @@ async def run() -> None:
     client_task: Optional[asyncio.Task] = None
     sender_task: Optional[asyncio.Task] = None
     last_reauth_signal: Optional[str] = None  # анти-дубль: реагируем только на СМЕНУ need_2fa
+    last_sms_request_at: float = 0.0         # анти-спам: время последнего create_client для need_2fa
+    last_start_failed: bool = False          # только что был неудачный start() — нужен backoff
 
     try:
         while not stop_event.is_set():
@@ -155,7 +188,32 @@ async def run() -> None:
 
             # 2) Создаём Client, если его нет или он мёртв
             if client_task is None or client_task.done():
+                # Anti-spam: если мы только что провалили старт — подождём подольше
+                if last_start_failed:
+                    logger.info(
+                        "backing off %.0fs before recreating pymax client (last start failed)",
+                        AUTH_FAIL_BACKOFF,
+                    )
+                    await _sleep_with_stop(stop_event, AUTH_FAIL_BACKOFF)
+                    if stop_event.is_set():
+                        break
+                    last_start_failed = False
+
+                # Anti-spam: не создаём новый Client чаще, чем раз в SMS_RESEND_COOLDOWN,
+                # чтобы не молотить api.oneme.ru SMS-запросами.
+                now = time.monotonic()
+                if now - last_sms_request_at < SMS_RESEND_COOLDOWN and last_sms_request_at > 0:
+                    wait = SMS_RESEND_COOLDOWN - (now - last_sms_request_at)
+                    logger.info(
+                        "sms-cooldown active, waiting %.0fs before next pymax start",
+                        max(0.0, wait),
+                    )
+                    await _sleep_with_stop(stop_event, max(0.0, wait))
+                    if stop_event.is_set():
+                        break
+
                 logger.info("creating PyMax client (status=%s)", status)
+                last_sms_request_at = time.monotonic()
                 client = build_client(phone, cache_dir)
                 client_task = asyncio.create_task(client.start(), name="pymax-client")
                 sender_task = asyncio.create_task(sender_loop(client, stop_event), name="pymax-sender")
@@ -167,16 +225,29 @@ async def run() -> None:
                     # start() не вернулся — клиент живой, идём дальше
                     pass
                 except Exception as exc:
-                    logger.warning("client.start() exited: %s", exc)
-                    # статус авторизации мог не выставиться — пробуем отметить need_2fa
-                    if "auth" in str(exc).lower() or "phone" in str(exc).lower() or "code" in str(exc).lower():
-                        await _post_auth_state("need_2fa", error=str(exc))
+                    last_start_failed = True
+                    # rate-limit — особый случай: даём длинный бэкофф
+                    if _is_rate_limit_error(exc):
+                        logger.warning(
+                            "rate-limit hit, backing off %.0fs (err=%s)",
+                            RATE_LIMIT_BACKOFF,
+                            exc,
+                        )
+                        await _post_auth_state("rate_limited", error=str(exc))
+                        await _sleep_with_stop(stop_event, RATE_LIMIT_BACKOFF)
+                        if stop_event.is_set():
+                            break
                     else:
-                        await _post_auth_state("unknown", error=str(exc))
+                        logger.warning("client.start() exited: %s", exc)
+                        # статус авторизации мог не выставиться — пробуем отметить need_2fa
+                        if _is_auth_error(exc):
+                            await _post_auth_state("need_2fa", error=str(exc))
+                        else:
+                            await _post_auth_state("unknown", error=str(exc))
 
             # 3) Подождём перед следующей итерацией
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=10.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
                 # stop_event выставлен — выходим
                 break
             except asyncio.TimeoutError:

@@ -67,7 +67,9 @@ def _unregister(rid: int) -> None:
 class QueueSmsCodeProvider:
     """SmsCodeProvider, берущий код из БД (положен владельцем через /code)."""
 
-    POLL_TIMEOUT = 300.0  # секунд ждём код
+    # 10 минут на ввод кода — иначе supervisor пойдёт пересоздавать Client,
+    # а каждый новый Client = новый запрос SMS к api.oneme.ru (rate-limit).
+    POLL_TIMEOUT = 600.0
     POLL_INTERVAL = 1.5
 
     async def get_code(self, phone: str) -> str:
@@ -94,7 +96,9 @@ class QueueSmsCodeProvider:
 class QueuePasswordProvider:
     """PasswordProvider, берущий 2FA-пароль из БД (владелец ввёл через /code)."""
 
-    POLL_TIMEOUT = 300.0
+    # 10 минут на ввод 2FA-пароля — иначе supervisor пойдёт пересоздавать Client,
+    # а каждый новый Client = новый запрос к api.oneme.ru (rate-limit).
+    POLL_TIMEOUT = 600.0
     POLL_INTERVAL = 1.5
 
     async def get_password(self, hint: str | None = None) -> str:
