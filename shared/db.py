@@ -433,7 +433,20 @@ def set_auth_state(
     status: str,
     error: Optional[str] = None,
     last_login: bool = False,
+    clear_error: bool = False,
 ) -> None:
+    """Обновить auth_state.
+
+    Параметры:
+      * ``status`` — новый статус (ok/need_2fa/rate_limited/unknown/...)
+      * ``error`` — если не ``None``, записывается в ``last_error``
+      * ``clear_error`` — если True, ``last_error`` сбрасывается в ``NULL``
+        даже если ``error is None``. Нужно для случаев, когда max-процесс
+        хочет «очистить» предыдущую ошибку (например, после успешного
+        start() или после ручного reauth). Без этого supervisor.post_auth_state
+        всегда передаёт ``error: null`` в API, и поле никогда не очищается.
+      * ``last_login`` — обновить ``last_login_at`` (используется при status=ok)
+    """
     with session_scope() as s:
         row = s.query(AuthState).first()
         if not row:
@@ -442,6 +455,8 @@ def set_auth_state(
         row.status = status
         if error is not None:
             row.last_error = error
+        elif clear_error:
+            row.last_error = None
         if last_login:
             row.last_login_at = datetime.utcnow()
         row.updated_at = datetime.utcnow()

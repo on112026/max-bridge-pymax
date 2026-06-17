@@ -87,6 +87,8 @@ class QueueSmsCodeProvider:
         # 2) Забрать код из api (он уже удалён из БД после peek)
         data = await _get(f"/auth/2fa/peek/{rid}")
         code = (data or {}).get("code") or ""
+        # Снимаем просроченный event — он уже не нужен.
+        _unregister(rid)
         if not code:
             raise RuntimeError(f"SMS code missing for rid={rid}")
         logger.info("got SMS code rid=%s (len=%d)", rid, len(code))

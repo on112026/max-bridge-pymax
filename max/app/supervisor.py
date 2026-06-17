@@ -54,12 +54,26 @@ async def _get_auth_state() -> dict:
         return {}
 
 
-async def _post_auth_state(status: str, error: Optional[str] = None) -> None:
+async def _post_auth_state(
+    status: str,
+    error: Optional[str] = None,
+    clear_error: bool = False,
+) -> None:
+    """Пробросить изменение auth_state в api.
+
+    Если ``clear_error=True`` — в БД будет сброшен ``last_error`` (даже если
+    error=None). Нужно, чтобы при status=ok и при ручном reauth прошлая
+    ошибка в /status не висела вечно.
+    """
     try:
         async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
             r = await c.post(
                 "/auth/state",
-                json={"status": status, "error": error},
+                json={
+                    "status": status,
+                    "error": error,
+                    "clear_error": clear_error,
+                },
                 headers=_headers(),
             )
             r.raise_for_status()
@@ -166,7 +180,8 @@ async def run() -> None:
                 # cooldown истёк — сбрасываем флаг, чтобы бот узнал о возврате
                 logger.info("rate-limit cooldown elapsed, resuming")
                 rate_limit_until = 0.0
-                await _post_auth_state("unknown", error=None)
+                # clear_error=True, чтобы прошлая rate-limit-ошибка не висела в /status
+                await _post_auth_state("unknown", error=None, clear_error=True)
 
             # 1) Проверим, не сигналил ли бот reauth
             auth = await _get_auth_state()
@@ -174,7 +189,9 @@ async def run() -> None:
             need_reauth = (
                 status == "need_2fa" and (auth.get("last_error") or "").startswith("reauth requested")
             )
-            # Свежий «reauth requested» — сбрасываем кэш и пересоздаём Client
+            # Свежий «reauth requested» — сбрасываем кэш и сразу
+            # пересоздаём Client в этом же цикле, не дожидаясь
+            # NORMAL_POLL_SECONDS (30s) следующей итерации.
             sig = f"{status}|{auth.get('last_error') or ''}"
             if need_reauth and sig != last_reauth_signal:
                 last_reauth_signal = sig
@@ -199,10 +216,19 @@ async def run() -> None:
                         await client.close()
                     except Exception:
                         pass
+                client = None
                 _wipe_cache(cache_dir)
-                # Сменим sig, чтобы следующий запуск Client прошёл как «нормальный»
-                await _post_auth_state("unknown", error=None)
+                # Сменим sig, чтобы следующий запуск Client прошёл как «нормальный».
+                # clear_error=True, чтобы маркер «reauth requested by owner»
+                # не висел в /status после того, как supervisor отреагировал.
+                await _post_auth_state("unknown", error=None, clear_error=True)
                 status = "unknown"
+                # Сбросим sms-cooldown и last_start_failed, чтобы не ждать
+                # ещё 15 минут после явного reauth от владельца.
+                last_sms_request_at = 0.0
+                last_start_failed = False
+                # НЕ возвращаемся в конец цикла — следующий блок (2) сам
+                # подхватит client_task is None и создаст Client немедленно.
 
             # 2) Создаём Client, если его нет или он мёртв
             if client_task is None or client_task.done():

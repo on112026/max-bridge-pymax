@@ -306,11 +306,20 @@ def get_status() -> StatusOut:
 class AuthStateIn(BaseModel):
     status: str
     error: Optional[str] = None
+    # Если True — ``last_error`` сбрасывается в NULL даже при ``error=None``.
+    # Нужно max-процессу, чтобы «очистить» предыдущую ошибку при status=ok
+    # или при ручном reauth (если раньше была rate-limit-ошибка).
+    clear_error: bool = False
 
 
 @app.post("/auth/state", response_model=OkOut, dependencies=[Depends(verify_api_key)])
 def post_auth_state(body: AuthStateIn) -> OkOut:
-    db.set_auth_state(body.status, error=body.error, last_login=body.status == "ok")
+    db.set_auth_state(
+        body.status,
+        error=body.error,
+        last_login=body.status == "ok",
+        clear_error=body.clear_error,
+    )
     return OkOut(ok=True)
 
 

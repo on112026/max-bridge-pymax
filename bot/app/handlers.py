@@ -179,6 +179,7 @@ async def reauth_sms_command(message: types.Message, state: FSMContext) -> None:
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
 
+    logger.info("reauth_sms requested by uid=%s", message.from_user.id)
     await message.answer(
         "🔐 Запускаю reauth MAX…\n"
         "Сессия MAX на сервере будет сброшена. Как только MAX пришлёт SMS или попросит пароль — "
@@ -186,24 +187,37 @@ async def reauth_sms_command(message: types.Message, state: FSMContext) -> None:
         "Введите код или пароль командой /code <число>."
     )
 
-    # 1) Сбросить auth_state на unknown + записать запрос «need_sms» (используем существующий need_2fa)
+    # 1) Сбросить auth_state на need_2fa с маркером "reauth requested by owner".
+    #    supervisor в max-процессе при следующей итерации увидит сигнал,
+    #    сотрёт cache и пересоздаст Client.
     try:
         await api.post_auth_state(status="need_2fa", error="reauth requested by owner")
     except Exception as exc:
+        logger.warning("post_auth_state failed: %s", exc)
         await message.answer(f"⚠️ Не удалось обновить auth_state: {exc}")
         return
 
-    # 2) Попытаемся «разбудить» max-процесс: для этого достаточно перевести
-    #    auth_state в «need_2fa» — supervisor в max-процессе при следующем цикле
-    #    поймёт, что нужно пересоздать Client.
-    #    ВАЖНО: фактическое стирание сессии делает max/app/supervisor.py —
-    #    он следит за auth_state и при need_2fa+ошибке стирает cache и
-    #    перезапускает Client.
+    # 2) Семантически помечаем, что владелец в reauth-режиме.
+    #    ВАЖНО: НЕ ставим ReauthSmsState.waiting_code на каждом запуске
+    #    автоматически — это вызывало конфликт с обработчиком текста и
+    #    "проглатывало" сообщения владельца. code_command работает и без
+    #    стейта (фильтр Command("code") срабатывает раньше), а
+    #    ReauthSmsState.waiting_code нужен только как маркер для прочих
+    #    текстовых сообщений, отправленных параллельно.
     await state.set_state(ReauthSmsState.waiting_code)
 
 
 async def code_command(message: types.Message, state: FSMContext) -> None:
-    """Ввод кода/пароля для текущего pending 2FA-запроса."""
+    """Ввод кода/пароля для текущего pending 2FA-запроса.
+
+    Особенности:
+    * Логируем КАЖДЫЙ вызов — иначе «в логах тишина» при ошибочных сценариях.
+    * Если pending_2fa_request_id уже None (max-процесс забрал код раньше
+      и залогинился, либо supervisor ещё не успел пересоздать Client после
+      wipe_cache), смотрим на last_2fa_request_at: если он свежий (< 10 мин),
+      значит max-процесс ещё в процессе создания Client и не успел
+      зарегистрировать новый rid. В этом случае просим подождать.
+    """
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
     args = (message.text or "").split()
@@ -215,23 +229,72 @@ async def code_command(message: types.Message, state: FSMContext) -> None:
         await message.answer("Код слишком короткий.")
         return
 
+    logger.info(
+        "/code received from uid=%s code_len=%d", message.from_user.id, len(code)
+    )
+
     try:
         s = await api.status()
     except Exception as exc:
+        logger.warning("code_command: api.status() failed: %s", exc)
         await message.answer(f"⚠️ API: {exc}")
         return
-    rid = (s.get("auth") or {}).get("pending_2fa_request_id")
+    auth = s.get("auth") or {}
+    rid = auth.get("pending_2fa_request_id")
+    last_2fa_at = auth.get("last_2fa_request_at")
+    status = auth.get("status")
+
     if not rid:
-        await message.answer(
-            "Сейчас MAX не запрашивает код. Возможно, сессия ещё жива — попробуйте позже."
-        )
+        # Возможно, max-процесс ещё в процессе создания Client после wipe_cache
+        # (а он занимает до 30 сек из-за NORMAL_POLL_SECONDS, см. supervisor).
+        # last_2fa_request_at свежий → новый запрос уже был, новый rid
+        # появится в ближайшее время.
+        recent = False
+        if last_2fa_at:
+            try:
+                from datetime import datetime, timezone, timedelta
+                ts_raw = last_2fa_at
+                if isinstance(ts_raw, str):
+                    ts = datetime.fromisoformat(
+                        ts_raw.replace("Z", "+00:00")
+                    )
+                else:
+                    ts = ts_raw
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                recent = (
+                    datetime.now(timezone.utc) - ts
+                ) < timedelta(minutes=10)
+            except Exception:
+                recent = False
+
+        if status == "ok":
+            await message.answer(
+                "✅ MAX уже залогинен. Код не нужен. Если сообщения не приходят — /status."
+            )
+        elif recent:
+            await message.answer(
+                "⏳ MAX ещё не успел зарегистрировать новый запрос кода. "
+                "Подождите ~30 секунд и пришлите /code ещё раз."
+            )
+        else:
+            await message.answer(
+                "Сейчас MAX не запрашивает код. Возможно, сессия ещё жива — попробуйте позже. "
+                "Если это после /reauth_sms — подождите 30 секунд и пришлите /code ещё раз."
+            )
         return
+
     try:
         await api.put_2fa(request_id=rid, code=code)
+        logger.info(
+            "/code forwarded to api: rid=%s uid=%s code_len=%d",
+            rid, message.from_user.id, len(code),
+        )
         await message.answer(
             f"✅ Код отправлен (request_id={rid}). Дождитесь логина MAX."
         )
     except Exception as exc:
+        logger.warning("code_command: put_2fa failed rid=%s: %s", rid, exc)
         await message.answer(f"⚠️ Не удалось передать код: {exc}")
         return
     await state.clear()
@@ -436,11 +499,16 @@ class AuthWatcher:
 
     POLL_INTERVAL = 3.0
 
+    # Сколько первых ошибок api подряд логируем как warning, прежде чем
+    # заткнуться в debug. Полезно при cold-start, когда api ещё не поднялся.
+    API_ERROR_WARN_BUDGET = 3
+
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self._notified_request_id: int | None = None
         self._last_known_status: str | None = None
         self._task: asyncio.Task | None = None
+        self._api_error_count: int = 0
 
     async def _notify_owner(self, text: str) -> None:
         for uid in settings.allowed_tg_user_ids:
@@ -466,9 +534,19 @@ class AuthWatcher:
     async def _tick(self) -> None:
         try:
             s = await api.status()
+            # Любой успешный запрос — сбрасываем счётчик ошибок.
+            self._api_error_count = 0
         except Exception as exc:
-            # api может быть не готов — не спамим
-            if not str(exc).startswith("ConnectError"):
+            # api может быть не готов (cold-start). Первые N ошибок логируем
+            # warning'ом, чтобы можно было увидеть проблему в логах; дальше
+            # уходим в debug, чтобы не зашумлять.
+            self._api_error_count += 1
+            if self._api_error_count <= self.API_ERROR_WARN_BUDGET:
+                logger.warning(
+                    "auth_watcher api error (%d/%d): %s",
+                    self._api_error_count, self.API_ERROR_WARN_BUDGET, exc,
+                )
+            else:
                 logger.debug("auth_watcher api error: %s", exc)
             return
         auth = s.get("auth") or {}
@@ -496,9 +574,19 @@ class AuthWatcher:
                     "\nКак только cooldown пройдёт, я пришлю уведомление."
                 )
             elif status == "unknown":
-                self._notified_request_id = None
+                # ВАЖНО: НЕ сбрасываем _notified_request_id на «unknown»,
+                # если есть живой pending rid — иначе при переходе статуса
+                # в unknown между двумя SMS-запросами (а max-процесс именно
+                # так делает: сначала «unknown», потом сразу «need_2fa»)
+                # мы потеряем уведомление.
+                if not rid:
+                    self._notified_request_id = None
         elif status == "need_2fa" and rid and rid != self._notified_request_id:
             # на случай, если status не менялся, но rid новый
+            self._notified_request_id = rid
+            await self._notify_owner(self._prompt_text(kind))
+        # status == "unknown" + есть rid → уведомим, если ещё не уведомляли
+        elif status == "unknown" and rid and rid != self._notified_request_id:
             self._notified_request_id = rid
             await self._notify_owner(self._prompt_text(kind))
 
@@ -555,12 +643,10 @@ def register_handlers(dp: Dispatcher) -> None:
         F.content_type.in_({"photo", "video", "document"}),
     )
 
-    # reauth_sms: игнорируем текст, пока FSM активна — настоящий код вводится через /code
-    dp.message.register(
-        lambda m: m.answer("Введите код командой /code <число>, либо /cancel."),
-        ReauthSmsState.waiting_code,
-        F.content_type == "text",
-    )
+    # Когда владелец в reauth-режиме, любой не-командный текст напоминаем
+    # ввести код через /code или выйти через /cancel. Не делаем это как
+    # глобальный перехватчик-лямбду (она «глохла» обычные текстовые
+    # сообщения владельца параллельно с /code).
 
     dp.callback_query.register(reply_callback, F.callback_data.startswith("reply:"))
     dp.callback_query.register(showid_callback, F.callback_data.startswith("showid:"))
