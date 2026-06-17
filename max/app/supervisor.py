@@ -20,7 +20,7 @@ from typing import Optional
 
 import httpx
 from pymax import Client
-from pymax.config import ClientConfig, DeviceInfo
+from pymax.config import ExtraConfig
 from pymax.auth.sms import SmsAuthFlow
 
 from app.auth import (
@@ -83,18 +83,19 @@ def _wipe_cache(cache_dir: str) -> None:
 
 
 def build_client(phone: str, cache_dir: str) -> Client:
-    """Создаёт новый Client с нашими auth-провайдерами."""
+    """Создаёт новый Client с нашими auth-провайдерами (pymax 2.2 API)."""
     flow = SmsAuthFlow(
         code_provider=QueueSmsCodeProvider(),
         password_provider=QueuePasswordProvider(),
     )
-    config = ClientConfig(
+    # extra_config не передаём — Client сам сгенерирует user_agent/device_id/mt_instance_id.
+    # Если потребуется — сюда можно прокинуть ExtraConfig(proxy=..., log_level=...).
+    client = Client(
         phone=phone,
-        work_dir=cache_dir,
         session_name="bridge",
+        work_dir=cache_dir,
+        auth_flow=flow,
     )
-    # device оставим дефолтным (PyMax сгенерирует)
-    client = Client(config=config, auth_flow=flow)
     register_bridge(client)
     return client
 
