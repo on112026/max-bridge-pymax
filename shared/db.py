@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime
@@ -104,8 +105,89 @@ class SystemState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+# Маппинг SQLAlchemy-типов на компактные имена SQLite-типов, которые мы
+# используем в ``ALTER TABLE ... ADD COLUMN``. Для SQLite формат хранения
+# не критичен (``NUMERIC`` / ``TEXT`` / ``INTEGER``), но значения должны
+# быть разборчивыми.
+_SQLITE_TYPE_MAP = {
+    Boolean: "INTEGER",
+    DateTime: "DATETIME",
+    Integer: "INTEGER",
+    String: "VARCHAR",
+    Text: "TEXT",
+}
+
+
+logger = logging.getLogger(__name__)
+
+
 _engine = None
 _SessionLocal: Optional[scoped_session] = None
+
+
+def _sqlite_type_name(column) -> str:
+    """Возвращает имя типа для ``ALTER TABLE ADD COLUMN``."""
+    py_type = column.type
+    # Строковые типы SQLAlchemy (String/Text) могут иметь длину.
+    if isinstance(py_type, String):
+        return "VARCHAR"
+    if isinstance(py_type, Text):
+        return "TEXT"
+    for cls, name in _SQLITE_TYPE_MAP.items():
+        if isinstance(py_type, cls):
+            return name
+    # На крайний случай — TEXT, всё сериализуемо.
+    return "TEXT"
+
+
+def _apply_schema_migrations(engine) -> None:
+    """Добавляет недостающие колонки к существующим таблицам.
+
+    ``Base.metadata.create_all`` создаёт только отсутствующие таблицы, но
+    не умеет делать ``ALTER TABLE`` для добавления новых колонок. На Railway
+    (и вообще на любом томе) старая БД переживает рестарты, и при добавлении
+    полей в модели приложение падает с ``sqlite3.OperationalError: no such
+    column: ...``. Чтобы этого избежать, проходимся по таблицам из метаданных,
+    сравниваем их с ``PRAGMA table_info`` и для отсутствующих колонок делаем
+    ``ALTER TABLE ... ADD COLUMN`` (идемпотентно: повторный запуск — no-op).
+    """
+    insp = engine.dialect.get_columns  # type: ignore[attr-defined]
+    with engine.begin() as conn:
+        from sqlalchemy import text
+
+        for table in Base.metadata.sorted_tables:
+            table_name = table.name
+            existing = {col["name"] for col in insp(conn, table_name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                # PRIMARY KEY и NOT NULL без DEFAULT в SQLite ALTER TABLE
+                # нельзя — у существующих строк нет значения. Все наши PK
+                # автоинкрементные и присутствуют с самого начала, поэтому
+                # миграция добавляет только nullable-колонки.
+                if column.primary_key:
+                    logger.warning(
+                        "schema migration: cannot add PRIMARY KEY column %s.%s; "
+                        "drop the table or run alembic",
+                        table_name,
+                        column.name,
+                    )
+                    continue
+                type_name = _sqlite_type_name(column)
+                nullable = "NULL" if column.nullable else "NOT NULL"
+                # Если колонка NOT NULL без Python-default, ALTER провалится;
+                # в наших моделях таких не должно быть, но на всякий случай
+                # приведём к NULL, чтобы не сломать уже лежащие данные.
+                if not column.nullable and (
+                    column.default is None and column.server_default is None
+                ):
+                    nullable = "NULL"
+                ddl = (
+                    f"ALTER TABLE {table_name} "
+                    f"ADD COLUMN {column.name} {type_name} {nullable}"
+                )
+                logger.info("schema migration: %s", ddl)
+                conn.execute(text(ddl))
 
 
 def init_engine(db_path: str) -> None:
@@ -121,6 +203,7 @@ def init_engine(db_path: str) -> None:
         future=True,
     )
     Base.metadata.create_all(_engine)
+    _apply_schema_migrations(_engine)
     _SessionLocal = scoped_session(
         sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
     )
