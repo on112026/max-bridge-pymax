@@ -33,6 +33,16 @@ os.environ["API_BASE_URL"] = f"http://localhost:{settings.api_port}"
 
 configure_logging(settings.log_level)
 
+# Инициализируем DB-движок в этом же процессе: supervisor (см.
+# ``_drain_2fa_codes_loop``) сам ходит в ``system_state`` за кодами/паролями,
+# а не только дёргает api через HTTP. Без ``init_engine`` цикл падает с
+# ``RuntimeError: DB engine не инициализирован`` на каждом тике.
+# ``init_engine`` идемпотентен (повторный вызов — no-op), так что параллельная
+# инициализация из api-процесса безопасна: оба указывают на один и тот же файл.
+from shared import db as shared_db  # noqa: E402
+
+shared_db.init_engine(settings.db_path)
+
 from app import supervisor  # noqa: E402
 
 logger = logging.getLogger(__name__)
