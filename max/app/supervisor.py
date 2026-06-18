@@ -313,36 +313,52 @@ async def run() -> None:
                 client = build_client(phone, cache_dir)
                 client_task = asyncio.create_task(client.start(), name="pymax-client")
                 sender_task = asyncio.create_task(sender_loop(client, stop_event), name="pymax-sender")
-                # Дождёмся немного, чтобы on_start успел выставить status=ok
+                # ВАЖНО: client.start() — fire-and-forget. Нельзя делать
+                # ``await asyncio.wait_for(client_task, timeout=...)`` — это
+                # **отменяет** таску по таймауту и убивает SmsAuthFlow.authenticate
+                # посреди ``await code_provider.get_code(...)``. В итоге Client
+                # закрывается раньше, чем MAX получит наш код, и до 2FA-фазы дело
+                # не доходит. Вместо этого спим 2 секунды через stop_event
+                # (без отмены client_task) и потом проверяем, не упала ли таска.
                 try:
-                    await asyncio.wait_for(client_task, timeout=2.0)
-                    # Если start() вернулся (например, ошибка авторизации) — упадём в except
+                    await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+                    # stop_event выставлен — выходим из run() через finally
+                    break
                 except asyncio.TimeoutError:
-                    # start() не вернулся — клиент живой, идём дальше
                     pass
-                except Exception as exc:
-                    last_start_failed = True
-                    # rate-limit — особый случай: даём длинный бэкофф
-                    # и ставим глобальный rate_limit_until, чтобы следующий цикл
-                    # не дёрнул api.oneme.ru снова сразу после sleep'а.
-                    if _is_rate_limit_error(exc):
-                        rate_limit_until = time.monotonic() + RATE_LIMIT_BACKOFF
-                        logger.warning(
-                            "rate-limit hit, backing off %.0fs (err=%s)",
-                            RATE_LIMIT_BACKOFF,
-                            exc,
-                        )
-                        await _post_auth_state("rate_limited", error=str(exc))
-                        await _sleep_with_stop(stop_event, RATE_LIMIT_BACKOFF)
-                        if stop_event.is_set():
-                            break
-                    else:
-                        logger.warning("client.start() exited: %s", exc)
-                        # статус авторизации мог не выставиться — пробуем отметить need_2fa
-                        if _is_auth_error(exc):
-                            await _post_auth_state("need_2fa", error=str(exc))
+
+                # Моментальный эксепшен (например, MAX сразу вернул
+                # error.limit.violate из on_start) — обработаем как раньше.
+                if client_task.done():
+                    exc: Optional[BaseException] = None
+                    try:
+                        exc = client_task.exception()
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        exc = None
+                    if exc is not None:
+                        last_start_failed = True
+                        # rate-limit — особый случай: даём длинный бэкофф
+                        # и ставим глобальный rate_limit_until, чтобы следующий
+                        # цикл не дёрнул api.oneme.ru снова сразу после sleep'а.
+                        if _is_rate_limit_error(exc):
+                            rate_limit_until = time.monotonic() + RATE_LIMIT_BACKOFF
+                            logger.warning(
+                                "rate-limit hit, backing off %.0fs (err=%s)",
+                                RATE_LIMIT_BACKOFF,
+                                exc,
+                            )
+                            await _post_auth_state("rate_limited", error=str(exc))
+                            await _sleep_with_stop(stop_event, RATE_LIMIT_BACKOFF)
+                            if stop_event.is_set():
+                                break
                         else:
-                            await _post_auth_state("unknown", error=str(exc))
+                            logger.warning("client.start() exited: %s", exc)
+                            # статус авторизации мог не выставиться — пробуем
+                            # отметит need_2fa
+                            if _is_auth_error(exc):
+                                await _post_auth_state("need_2fa", error=str(exc))
+                            else:
+                                await _post_auth_state("unknown", error=str(exc))
 
             # 3) Подождём перед следующей итерацией
             try:

@@ -241,6 +241,7 @@ async def code_command(message: types.Message, state: FSMContext) -> None:
         return
     auth = s.get("auth") or {}
     rid = auth.get("pending_2fa_request_id")
+    pending_kind = (auth.get("pending_2fa_kind") or "").lower() or "?"
     last_2fa_at = auth.get("last_2fa_request_at")
     status = auth.get("status")
 
@@ -287,11 +288,16 @@ async def code_command(message: types.Message, state: FSMContext) -> None:
     try:
         await api.put_2fa(request_id=rid, code=code)
         logger.info(
-            "/code forwarded to api: rid=%s uid=%s code_len=%d",
-            rid, message.from_user.id, len(code),
+            "/code forwarded to api: rid=%s uid=%s code_len=%d kind=%s",
+            rid, message.from_user.id, len(code), pending_kind,
         )
+        kind_label = {
+            "sms": "SMS-код",
+            "password": "2FA-пароль",
+        }.get(pending_kind, "код")
         await message.answer(
-            f"✅ Код отправлен (request_id={rid}). Дождитесь логина MAX."
+            f"✅ {kind_label} отправлен (request_id={rid}, kind={pending_kind}). "
+            "Дождитесь логина MAX."
         )
     except Exception as exc:
         logger.warning("code_command: put_2fa failed rid=%s: %s", rid, exc)
