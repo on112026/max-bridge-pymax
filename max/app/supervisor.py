@@ -98,19 +98,88 @@ def _wipe_cache(cache_dir: str) -> None:
     logger.warning("cache wiped: %s", cache_dir)
 
 
+async def _long_running_start(client: Client, stop_event: asyncio.Event) -> None:
+    """Обёртка вокруг ``client.start()``, которая держит Client живым.
+
+    Проблема: ``pymax.base.BaseClient.start()`` после первой успешной
+    синхронизации с MAX (``client started``) и закрытия long-poll соединения
+    (``closing connection``) возвращается чисто через ``else: return``. Для
+    supervisor'а это выглядит как «Client умер» — он пытается пересоздать
+    Client, и если ``status`` ещё ``ok``, мы упираемся в гард и не
+    пересоздаём. В итоге мост живёт, но новые события из MAX не
+    обрабатываются, потому что ``start()`` уже завершился.
+
+    Решение: после того, как ``client.start()`` вернулся без исключения,
+    переинициализируем runtime и снова вызываем ``start()``. При обрыве с
+    ``ConnectionError``/``EOFError``/``OSError``/``TimeoutError`` PyMax
+    делает reconnect сам (через свой внутренний ``while True`` и ``if not
+    extra_config.reconnect: raise``), но после чистого ``wait_closed()``
+    он всё равно возвращается — и тут уже мы перехватываем.
+    """
+    while not stop_event.is_set():
+        try:
+            await client.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "client.start() crashed: %s; reconnecting in %.1fs",
+                exc, client.extra_config.reconnect_delay,
+            )
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=client.extra_config.reconnect_delay,
+                )
+                # stop_event выставлен — выходим
+                return
+            except asyncio.TimeoutError:
+                pass
+        else:
+            # Чистое завершение (PyMax закрыл long-poll соединение после sync,
+            # ``else: return`` в pymax/base.py). Переинициализируем runtime
+            # и снова запускаем start(). Сессия на диске жива, поэтому
+            # повторный start() пройдёт через ``saved session loaded`` без
+            # SMS/2FA.
+            logger.info(
+                "client.start() returned cleanly; resetting runtime and reconnecting in %.1fs",
+                client.extra_config.reconnect_delay,
+            )
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=client.extra_config.reconnect_delay,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                client._reset_runtime()
+            except Exception as exc:
+                logger.warning("client._reset_runtime failed: %s", exc)
+
+
 def build_client(phone: str, cache_dir: str) -> Client:
     """Создаёт новый Client с нашими auth-провайдерами (pymax 2.2 API)."""
     flow = SmsAuthFlow(
         code_provider=QueueSmsCodeProvider(),
         password_provider=QueuePasswordProvider(),
     )
-    # extra_config не передаём — Client сам сгенерирует user_agent/device_id/mt_instance_id.
-    # Если потребуется — сюда можно прокинуть ExtraConfig(proxy=..., log_level=...).
+    # ``extra_config.reconnect=True`` — PyMax внутри ``start()`` сам делает
+    # reconnect при ``ConnectionError``/``EOFError``/``OSError``/
+    # ``TimeoutError``. Но после чистого ``wait_closed()`` (MAX сам закрыл
+    # long-poll соединение после sync) PyMax возвращается через ``else:
+    # return``. Это мы обрабатываем в ``_long_running_start`` wrapper'е.
+    extra = ExtraConfig(
+        reconnect=True,
+        reconnect_delay=2.0,
+    )
     client = Client(
         phone=phone,
         session_name="bridge",
         work_dir=cache_dir,
         auth_flow=flow,
+        extra_config=extra,
     )
     register_bridge(client)
     return client
@@ -397,7 +466,13 @@ async def run() -> None:
                 logger.info("creating PyMax client (status=%s)", status)
                 last_sms_request_at = time.monotonic()
                 client = build_client(phone, cache_dir)
-                client_task = asyncio.create_task(client.start(), name="pymax-client")
+                # Используем _long_running_start вместо прямого client.start(),
+                # чтобы PyMax не возвращался через ``else: return`` после первой
+                # синхронизации. Wrapper сам переинициализирует runtime и
+                # реконнектится. client_task никогда не завершается чисто.
+                client_task = asyncio.create_task(
+                    _long_running_start(client, stop_event), name="pymax-client",
+                )
                 sender_task = asyncio.create_task(sender_loop(client, stop_event), name="pymax-sender")
                 # ВАЖНО: client.start() — fire-and-forget. Нельзя делать
                 # ``await asyncio.wait_for(client_task, timeout=...)`` — это
