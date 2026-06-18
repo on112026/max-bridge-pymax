@@ -189,6 +189,60 @@ async def _drain_2fa_codes_loop(stop_event: asyncio.Event) -> None:
 _ALREADY_NOTIFIED: set[int] = set()
 
 
+SESSION_WATCH_INTERVAL = 5.0
+
+
+async def _watch_session_file(
+    stop_event: asyncio.Event,
+    cache_dir: str,
+    phone: str,
+) -> None:
+    """Следит за появлением/обновлением session-файла PyMax на диске.
+
+    PyMax сохраняет сессию в ``cache_dir/<session_name>.db`` (``bridge.db``
+    по умолчанию в нашем Client'е). Как только файл создан или его mtime
+    свежее момента старта Client — считаем, что мост авторизован, и
+    переводим ``auth_state`` в ``ok`` с очисткой ``last_error``.
+
+    Зачем это нужно: ``pymax.client.start()`` — fire-and-forget, но PyMax
+    завершает корутину ``start()`` сразу после первого ``client started``.
+    ``client_task.done() == True`` без исключения, и supervisor не
+    понимает, что мост живой — он пытается пересоздать Client, упирается
+    в ``sms-cooldown`` и сбрасывает сессию. Здесь мы сами выставляем
+    ``status=ok`` по факту появления session.db на диске.
+    """
+    session_path = Path(cache_dir) / "bridge.db"
+    logger.info(
+        "session watcher started (path=%s, poll=%.1fs)",
+        session_path, SESSION_WATCH_INTERVAL,
+    )
+    started_at = time.time()
+    last_posted_ok = False
+    while not stop_event.is_set():
+        try:
+            if session_path.is_file():
+                mtime = session_path.stat().st_mtime
+                # Файл создан ПОСЛЕ старта Client (с запасом 5с на лаги).
+                # До этого либо файла не было (мы только создали Client),
+                # либо mtime старый (прошлая сессия из cache_dir).
+                if mtime >= started_at - 5.0 and not last_posted_ok:
+                    logger.info(
+                        "session file detected (mtime=%.0f, started_at=%.0f), "
+                        "marking auth=ok",
+                        mtime, started_at,
+                    )
+                    await _post_auth_state(
+                        "ok", last_login=True, clear_error=True,
+                    )
+                    last_posted_ok = True
+        except Exception as exc:
+            logger.warning("session watcher error: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=SESSION_WATCH_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def run() -> None:
     """Главный цикл supervisor'а: пересоздаёт Client при необходимости."""
     phone = os.getenv("MAX_PHONE", "")
@@ -203,6 +257,7 @@ async def run() -> None:
     client_task: Optional[asyncio.Task] = None
     sender_task: Optional[asyncio.Task] = None
     drain_task: Optional[asyncio.Task] = None
+    session_task: Optional[asyncio.Task] = None
     last_reauth_signal: Optional[str] = None  # анти-дубль: реагируем только на СМЕНУ need_2fa
     last_sms_request_at: float = 0.0         # анти-спам: время последнего create_client для need_2fa
     last_start_failed: bool = False          # только что был неудачный start() — нужен backoff
@@ -210,6 +265,11 @@ async def run() -> None:
 
     # Запускаем drain system_state — без него мост мёртв (см. _drain_2fa_codes_loop).
     drain_task = asyncio.create_task(_drain_2fa_codes_loop(stop_event), name="2fa-drain")
+    # Следим за session.db на диске — как только он появится/обновится,
+    # переводим auth_state в ok (см. _watch_session_file).
+    session_task = asyncio.create_task(
+        _watch_session_file(stop_event, cache_dir, phone), name="session-watcher",
+    )
 
     try:
         while not stop_event.is_set():
@@ -382,12 +442,18 @@ async def run() -> None:
                 await sender_task
             except (asyncio.CancelledError, Exception):
                 pass
-        # Сигналим drain'у остановиться и дожидаемся его.
+        # Сигналим drain'у и session-watcher'у остановиться и дожидаемся их.
         stop_event.set()
         if drain_task is not None and not drain_task.done():
             drain_task.cancel()
             try:
                 await drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            try:
+                await session_task
             except (asyncio.CancelledError, Exception):
                 pass
         if client is not None:
