@@ -344,6 +344,32 @@ async def run() -> None:
 
             # 2) Создаём Client, если его нет или он мёртв
             if client_task is None or client_task.done():
+                # ВАЖНО: если мост уже авторизован (status=ok) и сессия на диске,
+                # НЕ пересоздаём Client. PyMax после первой синхронизации MAX
+                # закрывает соединение, и ``client.start()`` корректно возвращается
+                # (``pymax.app: client started`` → ``closing connection`` →
+                # ``start() return``). Это нормальное поведение, а не падение.
+                # Без этой проверки supervisor пересоздаёт Client раз в 30 секунд,
+                # MAX шлёт новый SMS, и мост зацикливается в reauth/sms-cooldown.
+                _auth_now = await _get_auth_state()
+                _status_now = _auth_now.get("status") or "unknown"
+                _session_path = Path(cache_dir) / "bridge.db"
+                if _status_now == "ok" and _session_path.is_file():
+                    if client_task is not None and client_task.done() and client_task.exception() is None:
+                        logger.debug(
+                            "pymax exited cleanly after auth (status=ok, session present); "
+                            "not recreating client",
+                        )
+                    else:
+                        logger.debug(
+                            "status=ok and session present; not recreating client",
+                        )
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+
                 # Anti-spam: если мы только что провалили старт — подождём подольше
                 if last_start_failed:
                     logger.info(
