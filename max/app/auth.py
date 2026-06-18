@@ -122,13 +122,20 @@ class QueuePasswordProvider:
         return pwd
 
 
-def notify_code_received(request_id: int, code: str) -> None:
-    """Вызывается из supervisor'ом, когда бот положил код через /code."""
-    _VALUES[request_id] = code
+def notify_code_received(request_id: int, code: Optional[str] = None) -> None:
+    """Будит провайдера (если он ждёт ``ev.wait()``) для ``request_id``.
+
+    Параметр ``code`` сохранён для обратной совместимости и для редкого
+    сценария, когда код известен сразу (например, из локального кэша). В
+    supervisor'е он не используется: код забирается провайдером сам через
+    ``GET /auth/2fa/peek/{rid}`` → ``db.take_pending_2fa_code``.
+    """
+    if code is not None:
+        _VALUES[request_id] = code
     ev = _EVENTS.get(request_id)
     if ev is not None:
         ev.set()
-    logger.info("notify_code_received rid=%s", request_id)
+    logger.info("notify_code_received rid=%s (code=%s)", request_id, "local" if code is not None else "from-db")
 
 
 def notify_code_cleared(request_id: int) -> None:

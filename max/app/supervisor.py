@@ -31,6 +31,7 @@ from app.auth import (
 )
 from app.bridge import register_bridge
 from app.sender import sender_loop
+from shared import db as shared_db
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,49 @@ async def _sleep_with_stop(stop_event: asyncio.Event, seconds: float) -> None:
         return
 
 
+# Интервал опроса system_state на предмет введённого кода/пароля.
+# Должен быть <= POLL_INTERVAL в QueueSmsCodeProvider/QueuePasswordProvider
+# (1.5s), иначе провайдер начнёт сам забирать код через /auth/2fa/peek
+# раньше, чем notify_code_received успеет разбудить ev.wait().
+CODE_DRAIN_INTERVAL = 0.5
+
+
+async def _drain_2fa_codes_loop(stop_event: asyncio.Event) -> None:
+    """Фоновая задача: следит за появлением 2fa_code:<rid> в ``system_state``
+    и будит соответствующий ``asyncio.Event`` в ``app.auth._EVENTS`` через
+    ``notify_code_received``. Сам код не забираем: после ``ev.wait()`` провайдер
+    сам вызовет ``GET /auth/2fa/peek/{rid}`` и ``db.take_pending_2fa_code``
+    корректно удалит строку.
+
+    Без этого провайдеры висели на ``ev.wait()`` до 10-минутного таймаута,
+    PyMax падал, а supervisor уходил в 15-минутный sms-cooldown. До 2FA-пароля
+    очередь не доходила — мост был сломан.
+    """
+    logger.info("2fa drain loop started (poll=%.1fs)", CODE_DRAIN_INTERVAL)
+    while not stop_event.is_set():
+        try:
+            keys = shared_db.list_2fa_code_keys()
+            for rid in keys:
+                if rid in _ALREADY_NOTIFIED:
+                    continue
+                _ALREADY_NOTIFIED.add(rid)
+                logger.info("drain: detected 2fa code rid=%s, waking provider", rid)
+                # value=None — провайдер сам заберёт код из БД через peek.
+                notify_code_received(rid, None)
+        except Exception as exc:
+            logger.warning("2fa drain loop error: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=CODE_DRAIN_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
+
+
+# Локальный set rid'ов, которые мы уже отдали в notify_code_received.
+# Нужен, чтобы не делать notify повторно (значение в system_state уже
+# забрано take_pending_2fa_code, а вот rid из auth_state может жить дольше).
+_ALREADY_NOTIFIED: set[int] = set()
+
+
 async def run() -> None:
     """Главный цикл supervisor'а: пересоздаёт Client при необходимости."""
     phone = os.getenv("MAX_PHONE", "")
@@ -158,10 +202,14 @@ async def run() -> None:
     client: Optional[Client] = None
     client_task: Optional[asyncio.Task] = None
     sender_task: Optional[asyncio.Task] = None
+    drain_task: Optional[asyncio.Task] = None
     last_reauth_signal: Optional[str] = None  # анти-дубль: реагируем только на СМЕНУ need_2fa
     last_sms_request_at: float = 0.0         # анти-спам: время последнего create_client для need_2fa
     last_start_failed: bool = False          # только что был неудачный start() — нужен backoff
     rate_limit_until: float = 0.0            # глобальный cooldown: до этого moment не дёргаем api
+
+    # Запускаем drain system_state — без него мост мёртв (см. _drain_2fa_codes_loop).
+    drain_task = asyncio.create_task(_drain_2fa_codes_loop(stop_event), name="2fa-drain")
 
     try:
         while not stop_event.is_set():
@@ -195,6 +243,10 @@ async def run() -> None:
             sig = f"{status}|{auth.get('last_error') or ''}"
             if need_reauth and sig != last_reauth_signal:
                 last_reauth_signal = sig
+                # Забываем прошлые rid'ы: после wipe_cache и рестарта Client'а
+                # провайдеры заведут новые, и старые ключи в system_state
+                # (если они там случайно залипли) уже не должны будить Event'ы.
+                _ALREADY_NOTIFIED.clear()
                 logger.warning("reauth requested by owner, wiping cache and recreating client")
                 # Остановим текущий client, если жив
                 if client_task is not None and not client_task.done():
@@ -312,6 +364,14 @@ async def run() -> None:
             sender_task.cancel()
             try:
                 await sender_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Сигналим drain'у остановиться и дожидаемся его.
+        stop_event.set()
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            try:
+                await drain_task
             except (asyncio.CancelledError, Exception):
                 pass
         if client is not None:

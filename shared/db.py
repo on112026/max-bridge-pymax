@@ -503,6 +503,29 @@ def put_2fa_code(request_id: int, code: str) -> None:
             s.add(SystemState(key=key, value=code))
 
 
+def list_2fa_code_keys() -> List[int]:
+    """Список request_id (int), для которых владелец уже положил код/пароль
+    в ``system_state`` (ключ вида ``2fa_code:<rid>``).
+
+    Используется max-процессом (supervisor) для фонового «drain» —
+    чтобы разбудить локальный ``asyncio.Event`` в ``app.auth`` после того,
+    как бот положил код через ``/code``.
+    """
+    with session_scope() as s:
+        rows = (
+            s.query(SystemState)
+            .filter(SystemState.key.like("2fa_code:%"))
+            .all()
+        )
+        out: List[int] = []
+        for r in rows:
+            try:
+                out.append(int(r.key.split(":", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return out
+
+
 def clear_2fa_request() -> None:
     with session_scope() as s:
         row = s.query(AuthState).first()
