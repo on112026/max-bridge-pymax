@@ -43,10 +43,8 @@ COPY max/    ./max/
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 
 # Гарантируем, что нужные каталоги существуют (тома /data и /app/cache).
-RUN mkdir -p /data/media/inbox /app/cache
+RUN mkdir -p /data/media/inbox /data/cache
 
 EXPOSE 8000
-
-# VOLUME ["/data", "/app/cache"]
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]

@@ -59,12 +59,17 @@ async def _post_auth_state(
     status: str,
     error: Optional[str] = None,
     clear_error: bool = False,
+    last_login: bool = False,
 ) -> None:
     """Пробросить изменение auth_state в api.
 
-    Если ``clear_error=True`` — в БД будет сброшен ``last_error`` (даже если
-    error=None). Нужно, чтобы при status=ok и при ручном reauth прошлая
-    ошибка в /status не висела вечно.
+    Параметры:
+      * ``status`` — новый статус (``ok``/``need_2fa``/``rate_limited``/``unknown``).
+      * ``error`` — если не ``None``, записывается в ``last_error``.
+      * ``clear_error=True`` — сбрасывает ``last_error`` в NULL даже если
+        ``error is None``. Нужно при status=ok и при ручном reauth.
+      * ``last_login=True`` — обновить ``last_login_at`` (используется при
+        status=ok).
     """
     try:
         async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
@@ -74,6 +79,7 @@ async def _post_auth_state(
                     "status": status,
                     "error": error,
                     "clear_error": clear_error,
+                    "last_login": last_login,
                 },
                 headers=_headers(),
             )
@@ -280,7 +286,7 @@ async def _watch_session_file(
     в ``sms-cooldown`` и сбрасывает сессию. Здесь мы сами выставляем
     ``status=ok`` по факту появления session.db на диске.
     """
-    session_path = Path(cache_dir) / "bridge.db"
+    session_path = Path(cache_dir) / "bridge"
     logger.info(
         "session watcher started (path=%s, poll=%.1fs)",
         session_path, SESSION_WATCH_INTERVAL,
@@ -422,7 +428,7 @@ async def run() -> None:
                 # MAX шлёт новый SMS, и мост зацикливается в reauth/sms-cooldown.
                 _auth_now = await _get_auth_state()
                 _status_now = _auth_now.get("status") or "unknown"
-                _session_path = Path(cache_dir) / "bridge.db"
+                _session_path = Path(cache_dir) / "bridge"
                 if _status_now == "ok" and _session_path.is_file():
                     if client_task is not None and client_task.done() and client_task.exception() is None:
                         logger.debug(

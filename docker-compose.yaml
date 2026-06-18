@@ -29,7 +29,7 @@ services:
       API_BASE_URL: http://127.0.0.1:${API_PORT:-8000}
       DB_PATH: /data/bridge.db
       MEDIA_DIR: /data/media
-      CACHE_DIR: /app/cache
+      CACHE_DIR: /data/cache
       PYTHONUNBUFFERED: "1"
     ports:
       # API наружу можно не пробрасывать, если бот/мост работают в одной сети.
@@ -37,7 +37,6 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - bridge_data:/data
-      - bridge_cache:/app/cache
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
       interval: 30s
@@ -52,4 +51,3 @@ services:
 
 volumes:
   bridge_data:
-  bridge_cache:
