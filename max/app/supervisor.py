@@ -321,7 +321,7 @@ async def _watch_session_file(
 async def run() -> None:
     """Главный цикл supervisor'а: пересоздаёт Client при необходимости."""
     phone = os.getenv("MAX_PHONE", "")
-    cache_dir = os.getenv("CACHE_DIR", "/app/cache")
+    cache_dir = os.getenv("CACHE_DIR", "/data/cache")
     if not phone:
         logger.error("MAX_PHONE не задан, supervisor не может работать")
         await _post_auth_state("unknown", "MAX_PHONE env is empty")
