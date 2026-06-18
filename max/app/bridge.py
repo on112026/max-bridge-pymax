@@ -174,7 +174,25 @@ def register_bridge(client) -> None:
     @client.on_start()
     async def _on_start() -> None:
         logger.info("PyMax client started, marking auth=ok")
-        await _post("/auth/state", {"status": "ok"})
+        # ВАЖНО: передаём ``clear_error=True``, чтобы прошлая ошибка
+        # (например, ``error.limit.violate`` от прошлой неудачной попытки)
+        # не висела в /status после успешной авторизации. Без этого
+        # AuthWatcher в боте не увидит переход need_2fa → ok и не пришлёт
+        # сообщение «✅ MAX: вход выполнен успешно».
+        try:
+            async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
+                r = await c.post(
+                    "/auth/state",
+                    json={
+                        "status": "ok",
+                        "last_login": True,
+                        "clear_error": True,
+                    },
+                    headers=_headers(),
+                )
+                r.raise_for_status()
+        except Exception as exc:
+            logger.warning("on_start: post auth_state ok failed: %s", exc)
 
     @client.on_chat_update()
     async def _on_chat_update(chat: MaxChat) -> None:
