@@ -532,7 +532,7 @@ async def run() -> None:
                 continue
 
             if action == "sms":
-                # Anti-spam: не дёргаем MAX чаще, чем раз в SMS_RESEND_COOLDOWN
+                # Anti-spam: не дёргаем MAX чаще, чем раз in SMS_RESEND_COOLDOWN
                 now = time.monotonic()
                 if last_sms_request_at > 0 and now - last_sms_request_at < SMS_RESEND_COOLDOWN:
                     wait = SMS_RESEND_COOLDOWN - (now - last_sms_request_at)

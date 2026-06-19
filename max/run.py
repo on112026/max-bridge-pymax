@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "max"))
 # Экспортируем ключевые переменные для auth.py и sender.py
 os.environ.setdefault("API_BASE_URL", "http://localhost:8000")
 os.environ.setdefault("MEDIA_DIR", "/data/media")
-os.environ.setdefault("CACHE_DIR", "/app/cache")
+os.environ.setdefault("CACHE_DIR", "/data/cache")
 
 from shared.config import load_settings  # noqa: E402
 from shared.log_setup import configure_logging  # noqa: E402

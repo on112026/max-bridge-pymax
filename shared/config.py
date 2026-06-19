@@ -50,7 +50,7 @@ class Settings:
 
     # MAX (PyMax)
     max_phone: str = ""
-    cache_dir: str = "/app/cache"  # PyMax session + sqlite cache
+    cache_dir: str = "/data/cache"  # PyMax session + sqlite cache
 
     # API
     api_host: str = "0.0.0.0"
@@ -83,7 +83,7 @@ def load_settings() -> Settings:
             int(x) for x in _env_list("ALLOWED_TG_USER_IDS") if x.isdigit()
         ],
         max_phone=_env("MAX_PHONE", "") or "",
-        cache_dir=_env("CACHE_DIR", "/app/cache") or "/app/cache",
+        cache_dir=_env("CACHE_DIR", "/data/cache") or "/data/cache",
         api_host=_env("API_HOST", "0.0.0.0") or "0.0.0.0",
         api_port=_env_int("API_PORT", 8000),
         db_path=_env("DB_PATH", "/data/bridge.db") or "/data/bridge.db",
