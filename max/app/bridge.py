@@ -172,7 +172,7 @@ def register_bridge(client) -> None:
     """Регистрирует обработчики на готовом client (после Client(...))."""
 
     @client.on_start()
-    async def _on_start() -> None:
+    async def _on_start(client) -> None:
         logger.info("PyMax client started, marking auth=ok")
         # ВАЖНО: передаём ``clear_error=True``, чтобы прошлая ошибка
         # (например, ``error.limit.violate`` от прошлой неудачной попытки)
