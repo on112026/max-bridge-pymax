@@ -1,15 +1,21 @@
 """Хэндлеры команд и callback'ов Telegram-бота (этап 2, PyMax).
 
-Удалены:
-- /reauth (старый headful-режим с управлением браузером)
-- HeadfulState, hf_* callbacks, headful_main_keyboard
-- /vnc, noVNC, скриншоты — больше не нужны, PyMax авторизуется через SMS/2FA
+Модель авторизации «только по команде» (см. ``api/main.py``):
 
-Добавлены:
-- /reauth_sms — перевод MAX в reauth (стирает сессию), затем max-процесс
-  начинает заново логин по номеру и запрашивает SMS/2FA через бота
-- /code <N> — ввод SMS-кода/пароля для текущего pending-запроса
-- AuthWatcher — фоновый поллер auth_state, шлёт владельцу push о запросе кода
+* На cold-start ``auth_state.status = auth_required`` и supervisor НЕ
+  поднимает PyMax Client. Бот (через ``AuthWatcher``) видит это и присылает
+  владельцу inline-меню: «🔐 SMS-авторизация», «📂 Подключиться по сессии»,
+  «📎 Загрузить файл сессии», «⛔ Отмена».
+* При нажатии inline-кнопки бот кладёт ``pending_action`` через
+  ``/auth/action``, и supervisor на следующей итерации поднимает Client
+  (с wipe cache для SMS, без wipe для session).
+* Если владелец вручную положил session-файл в кэш (например, руками на
+  сервере), supervisor увидит его через session-watcher и переведёт
+  ``auth_state.status = session_attached``. Бот пришлёт короткое уведомление
+  с inline-кнопкой «Подключиться по сессии».
+* На каждом шаге бот присылает владельцу отдельное сообщение: «🔐 MAX
+  не подключён…», «📨 Запрашиваю SMS у MAX…», «🔌 Пробую подключиться
+  по сессии…», «⚠️ Не удалось…» — никаких «тихих» действий.
 """
 
 from __future__ import annotations
@@ -18,7 +24,8 @@ import asyncio
 import io
 import logging
 import os
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -26,13 +33,19 @@ from aiogram.fsm.context import FSMContext
 
 from app.api_client import api
 from app.config import settings
-from app.keyboards import event_inline_keyboard, main_reply_keyboard
+from app.keyboards import (
+    AuthActionCallback,
+    auth_choice_keyboard,
+    event_inline_keyboard,
+    main_reply_keyboard,
+)
 from app.sender import forward_event
-from app.states import ReplyState, ReauthSmsState
+from app.states import ReplyState, ReauthSmsState, UploadSessionState
 
 logger = logging.getLogger(__name__)
 
 MAX_TG_DOWNLOAD = 49 * 1024 * 1024
+MAX_SESSION_SIZE = 50 * 1024 * 1024
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -66,7 +79,8 @@ async def start_command(message: types.Message) -> None:
         "👋 Я мост MAX → Telegram (этап 2, на PyMax).\n"
         "Все новые сообщения MAX будут приходить сюда автоматически.\n"
         "Ответить — кнопка «💬 Ответить» под сообщением или /reply <chat_id>.\n"
-        "Если MAX-сессия слетела — /reauth_sms: я попрошу у MAX новый код.",
+        "Если MAX-сессия слетела — /reauth_sms: я попрошу у MAX новый код.\n"
+        "Если нужно подключиться по сохранённой сессии — нажмите «📂 Загрузить сессию MAX».",
         reply_markup=main_reply_keyboard(),
     )
 
@@ -81,9 +95,10 @@ async def help_command(message: types.Message) -> None:
         "/chats — список MAX-чатов\n"
         "/reply <chat_id> — следующее сообщение уйдёт в этот чат\n"
         "/history <chat_id> [N=20] — последние N сообщений\n"
-        "/reauth_sms — сбросить MAX-сессию и войти заново (придёт SMS или 2FA)\n"
+        "/reauth_sms — войти в MAX через SMS/2FA (отправит код в MAX)\n"
+        "/upload_session — загрузить файл сессии MAX (bridge.db)\n"
         "/code <число> — ввести SMS-код или 2FA-пароль для текущего запроса\n"
-        "/cancel — выйти из режима ответа / reauth\n",
+        "/cancel — выйти из режима ответа / reauth / upload\n",
         reply_markup=main_reply_keyboard(),
     )
 
@@ -103,10 +118,14 @@ async def status_command(message: types.Message) -> None:
         "password": "2FA-пароль",
         None: "—",
     }.get(auth.get("pending_2fa_kind"), auth.get("pending_2fa_kind") or "—")
+    pending_action = auth.get("pending_action") or "—"
+    has_session = bool(auth.get("session_file_path"))
     text = (
         f"🔐 MAX auth: <b>{_escape(str(auth.get('status')))}</b>\n"
         f"   pending_2fa: {auth.get('pending_2fa_request_id') or '—'} "
         f"(тип: {kind_label})\n"
+        f"   pending_action: <code>{_escape(str(pending_action))}</code>\n"
+        f"   session_file: {'<code>' + _escape(str(auth.get('session_file_path'))) + '</code>' if has_session else '—'}\n"
         f"   last_2fa_at: {auth.get('last_2fa_request_at') or '—'}\n"
         f"   last_login: {auth.get('last_login_at') or '—'}\n"
         f"   error: {_escape(str(auth.get('last_error') or '—'))}\n"
@@ -165,58 +184,45 @@ async def history_command(message: types.Message) -> None:
             await message.answer(f"⚠️ Не удалось переслать {ev.get('id')}: {exc}")
 
 
-# ---------- /reauth_sms — вход в MAX заново через SMS/2FA ----------
+# ---------- /reauth_sms — войти в MAX через SMS/2FA ----------
+#
+# ВАЖНО: в новой модели этот хэндлер НЕ стирает сессию сам — он просто
+# кладёт ``pending_action="sms"`` в БД. Supervisor при следующей итерации
+# стирает cache, поднимает Client с SmsAuthFlow, тот запрашивает SMS-код
+# через /auth/2fa/request → бот видит pending_2fa_request_id и просит
+# владельца прислать /code <число>.
 
 
 async def reauth_sms_command(message: types.Message, state: FSMContext) -> None:
-    """Стереть локальную сессию MAX и дать сигнал max-процессу начать новый логин.
-
-    max-процесс перезапустит PyMax Client с нуля, вызовет SmsAuthFlow,
-    тот попросит SMS-код → max-процесс положит pending-запрос в БД →
-    бот увидит это в AuthWatcher и пришлёт владельцу уведомление
-    «MAX ждёт SMS-код, пришлите /code <число>».
-    """
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
 
     logger.info("reauth_sms requested by uid=%s", message.from_user.id)
     await message.answer(
-        "🔐 Запускаю reauth MAX…\n"
-        "Сессия MAX на сервере будет сброшена. Как только MAX пришлёт SMS или попросит пароль — "
-        "я пришлю уведомление сюда.\n"
-        "Введите код или пароль командой /code <число>."
+        "🔐 Запрашиваю у MAX SMS-авторизацию…\n"
+        "• Если в кэше есть живая сессия — она будет стёрта.\n"
+        "• Как только MAX пришлёт SMS или попросит пароль — пришлю уведомление.\n"
+        "• Введите код или пароль командой /code <число>.\n"
+        "• Отменить можно кнопкой «⛔ Отмена» в сообщении с меню."
     )
 
-    # 1) Сбросить auth_state на need_2fa с маркером "reauth requested by owner".
-    #    supervisor в max-процессе при следующей итерации увидит сигнал,
-    #    сотрёт cache и пересоздаст Client.
     try:
-        await api.post_auth_state(status="need_2fa", error="reauth requested by owner")
+        await api.post_auth_action("sms")
     except Exception as exc:
-        logger.warning("post_auth_state failed: %s", exc)
-        await message.answer(f"⚠️ Не удалось обновить auth_state: {exc}")
+        logger.warning("post_auth_action(sms) failed: %s", exc)
+        await message.answer(f"⚠️ Не удалось передать команду API: {exc}")
         return
 
-    # 2) Семантически помечаем, что владелец в reauth-режиме.
-    #    ВАЖНО: НЕ ставим ReauthSmsState.waiting_code на каждом запуске
-    #    автоматически — это вызывало конфликт с обработчиком текста и
-    #    "проглатывало" сообщения владельца. code_command работает и без
-    #    стейта (фильтр Command("code") срабатывает раньше), а
-    #    ReauthSmsState.waiting_code нужен только как маркер для прочих
-    #    текстовых сообщений, отправленных параллельно.
+    await message.answer("📨 Команда отправлена в supervisor. Жду ответа MAX (обычно 5–30 секунд).")
     await state.set_state(ReauthSmsState.waiting_code)
 
 
 async def code_command(message: types.Message, state: FSMContext) -> None:
     """Ввод кода/пароля для текущего pending 2FA-запроса.
 
-    Особенности:
-    * Логируем КАЖДЫЙ вызов — иначе «в логах тишина» при ошибочных сценариях.
-    * Если pending_2fa_request_id уже None (max-процесс забрал код раньше
-      и залогинился, либо supervisor ещё не успел пересоздать Client после
-      wipe_cache), смотрим на last_2fa_request_at: если он свежий (< 10 мин),
-      значит max-процесс ещё в процессе создания Client и не успел
-      зарегистрировать новый rid. В этом случае просим подождать.
+    Логика совпадает с прежней версией, но обновлена под новый auth-флоу:
+    если status=auth_required без pending rid — просим владельца сначала
+    нажать /reauth_sms (а не /code сразу).
     """
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
@@ -246,32 +252,30 @@ async def code_command(message: types.Message, state: FSMContext) -> None:
     status = auth.get("status")
 
     if not rid:
-        # Возможно, max-процесс ещё в процессе создания Client после wipe_cache
-        # (а он занимает до 30 сек из-за NORMAL_POLL_SECONDS, см. supervisor).
-        # last_2fa_request_at свежий → новый запрос уже был, новый rid
-        # появится в ближайшее время.
         recent = False
         if last_2fa_at:
             try:
                 from datetime import datetime, timezone, timedelta
                 ts_raw = last_2fa_at
                 if isinstance(ts_raw, str):
-                    ts = datetime.fromisoformat(
-                        ts_raw.replace("Z", "+00:00")
-                    )
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
                 else:
                     ts = ts_raw
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
-                recent = (
-                    datetime.now(timezone.utc) - ts
-                ) < timedelta(minutes=10)
+                recent = (datetime.now(timezone.utc) - ts) < timedelta(minutes=10)
             except Exception:
                 recent = False
 
         if status == "ok":
             await message.answer(
                 "✅ MAX уже залогинен. Код не нужен. Если сообщения не приходят — /status."
+            )
+        elif status == "auth_required":
+            await message.answer(
+                "🔐 MAX сейчас ожидает вашу команду.\n"
+                "Нажмите /reauth_sms, чтобы начать SMS-авторизацию,\n"
+                "или «📂 Загрузить сессию MAX», чтобы загрузить файл."
             )
         elif recent:
             await message.answer(
@@ -347,6 +351,26 @@ async def button_listen(message: types.Message) -> None:
         "Слушаю автоматически. Команда /chats — список диалогов.",
         parse_mode="HTML",
     )
+
+
+async def button_upload_session(message: types.Message, state: FSMContext) -> None:
+    """Обработчик reply-кнопки «📂 Загрузить сессию MAX»."""
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+    await state.set_state(UploadSessionState.waiting_file)
+    await message.answer(
+        "📂 Пришлите <b>документом</b> файл сессии MAX "
+        "(обычно <code>bridge.db</code>, до 50 МБ).\n"
+        "После загрузки файл попадёт в кэш MAX, и я пришлю inline-меню "
+        "«📂 Подключиться по сессии».\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+    )
+
+
+async def upload_session_command(message: types.Message, state: FSMContext) -> None:
+    """Команда /upload_session — то же, что и reply-кнопка."""
+    await button_upload_session(message, state)
 
 
 # ---------- Reply FSM (отправка в MAX) ----------
@@ -447,7 +471,78 @@ async def reply_media(message: types.Message, state: FSMContext) -> None:
     await state.clear()
 
 
-# ---------- Inline callbacks ----------
+# ---------- Приём файла сессии MAX (FSM UploadSessionState) ----------
+
+
+async def upload_session_file_handler(message: types.Message, state: FSMContext) -> None:
+    """Хэндлер на документ в состоянии ``UploadSessionState.waiting_file``.
+
+    Скачивает файл из Telegram, отдаёт в ``/admin/session/upload``,
+    сбрасывает FSM и подсказывает дальнейшее действие («📂 Подключиться
+    по сессии» — inline-кнопка из AuthWatcher'а придёт сама).
+    """
+    if not _is_allowed(message.from_user.id):
+        await state.clear()
+        return await _reject(message)
+
+    doc = message.document
+    if not doc:
+        await message.answer(
+            "Жду файл сессии <b>документом</b> (не картинкой). "
+            "/cancel — отмена.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Проверим размер до скачивания (Telegram всё равно отдаёт file_size).
+    if doc.file_size and doc.file_size > MAX_SESSION_SIZE:
+        await message.answer("Файл больше 50 МБ — не подходит.")
+        return
+
+    try:
+        tg_file = await message.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await message.bot.download_file(tg_file.file_path, buf)
+        data = buf.getvalue()
+    except Exception as exc:
+        logger.warning("download session file failed: %s", exc)
+        await message.answer(f"⚠️ Не удалось скачать файл: {exc}")
+        return
+
+    if not data:
+        await message.answer("⚠️ Файл пустой.")
+        return
+
+    # Сообщим владельцу, что файл ушёл в api.
+    filename = doc.file_name or "bridge.db"
+    await message.answer(
+        f"📤 Загружаю {filename} ({len(data)} байт) на сервер…"
+    )
+
+    try:
+        result = await api.upload_session_file(
+            file_bytes=data,
+            filename=filename,
+            content_type=doc.mime_type or "application/octet-stream",
+        )
+    except Exception as exc:
+        logger.warning("upload_session_file failed: %s", exc)
+        await message.answer(f"⚠️ API отказал в загрузке: {exc}")
+        return
+
+    logger.info(
+        "session uploaded by uid=%s name=%s size=%d path=%s",
+        message.from_user.id, filename, len(data),
+        result.get("path") if isinstance(result, dict) else "?",
+    )
+    await message.answer(
+        f"✅ Session-файл принят ({len(data)} байт).\n"
+        "Подождите ~3 секунды — пришлю inline-меню с кнопкой «📂 Подключиться по сессии»."
+    )
+    await state.clear()
+
+
+# ---------- Inline callbacks: reply/showid/history + auth-action ----------
 
 
 async def reply_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
@@ -495,57 +590,153 @@ async def history_callback(callback: types.CallbackQuery) -> None:
             await callback.message.answer(f"⚠️ Не удалось переслать {ev.get('id')}: {exc}")
 
 
+# ---------- Inline: auth:sms / auth:session / auth:upload / auth:cancel ----------
+
+
+async def auth_action_callback(
+    callback: types.CallbackQuery, state: FSMContext
+) -> None:
+    """Обработчик inline-кнопок выбора способа авторизации MAX.
+
+    ``callback.data`` вида ``auth:<action>``, где ``action`` ∈
+    {sms, session, cancel, upload}. Для «upload» дополнительно ставим
+    FSM-состояние и просим прислать файл.
+    """
+    if not callback.from_user or not _is_allowed(callback.from_user.id):
+        return await callback.answer("⛔", show_alert=True)
+    if not callback.data:
+        return await callback.answer()
+    try:
+        cb = AuthActionCallback.unpack(callback.data)
+    except Exception:
+        logger.warning("auth_action_callback: bad data %r", callback.data)
+        return await callback.answer("⚠️", show_alert=True)
+
+    action = (cb.action or "").lower()
+    if action not in ("sms", "session", "cancel", "upload"):
+        return await callback.answer(f"⚠️ неизвестное действие: {action}", show_alert=True)
+
+    # Подтверждаем нажатие сразу, чтобы Telegram не показывал «часики».
+    await callback.answer()
+
+    if action == "upload":
+        # Дополнительно ставим FSM и просим прислать файл.
+        await state.set_state(UploadSessionState.waiting_file)
+        await callback.message.answer(
+            "📂 Пришлите <b>документом</b> файл сессии MAX "
+            "(обычно <code>bridge.db</code>, до 50 МБ).\n"
+            "/cancel — отмена.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Для sms / session / cancel — шлём pending_action в api.
+    pretty = {
+        "sms": "🔐 SMS-авторизация",
+        "session": "📂 Подключиться по сессии",
+        "cancel": "⛔ Отмена",
+    }.get(action, action)
+    await callback.message.answer(f"{pretty}: отправляю команду supervisor'у…")
+
+    try:
+        await api.post_auth_action(action)
+    except Exception as exc:
+        logger.warning("post_auth_action(%s) failed: %s", action, exc)
+        await callback.message.answer(f"⚠️ API: {exc}")
+        return
+
+    if action == "sms":
+        await callback.message.answer(
+            "📨 Запросил SMS у MAX. Жду ответа (5–30 секунд). "
+            "Как только придёт код — пришлю /code."
+        )
+        await state.set_state(ReauthSmsState.waiting_code)
+    elif action == "session":
+        await callback.message.answer(
+            "🔌 Поднимаю MAX Client по сохранённой сессии… "
+            "Если сессия валидна — вход пройдёт без SMS."
+        )
+    elif action == "cancel":
+        await callback.message.answer(
+            "🛑 Отменил текущее действие. MAX вернётся в режим "
+            "ожидания команды."
+        )
+        await state.clear()
+
+
 # ---------- AuthWatcher: поллер auth_state ----------
 
 
 class AuthWatcher:
-    """Каждые N секунд проверяет auth_state. Если появился pending_2fa_request_id
-    и владельцу ещё не ушло уведомление — шлёт push в Telegram.
+    """Каждые N секунд проверяет auth_state и:
+
+    * при status=ok — пуш «✅ MAX: вход выполнен успешно»;
+    * при status=need_2fa — пуш с просьбой прислать /code;
+    * при status=rate_limited — пуш с подсказкой про cooldown;
+    * при status=auth_required — пуш с inline-меню «Что делать?»;
+    * при status=session_attached — пуш с inline-меню
+      «📂 Подключиться по сессии»;
+    * потребляет ``notify_message`` (если max-процесс положил одноразовое
+      сообщение, например «session uploaded, size=…») и пересылает его
+      владельцу.
     """
 
     POLL_INTERVAL = 3.0
 
-    # Сколько первых ошибок api подряд логируем как warning, прежде чем
-    # заткнуться в debug. Полезно при cold-start, когда api ещё не поднялся.
     API_ERROR_WARN_BUDGET = 3
 
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
-        self._notified_request_id: int | None = None
-        self._last_known_status: str | None = None
-        self._task: asyncio.Task | None = None
+        self._notified_request_id: Optional[int] = None
+        self._last_known_status: Optional[str] = None
+        self._last_known_pending_action: Optional[str] = None
+        self._last_known_session_path: Optional[str] = None
+        self._task: Optional[asyncio.Task] = None
         self._api_error_count: int = 0
 
-    async def _notify_owner(self, text: str) -> None:
+    async def _notify_owner(self, text: str, reply_markup=None) -> None:
         for uid in settings.allowed_tg_user_ids:
             try:
-                await self.bot.send_message(uid, text)
+                await self.bot.send_message(
+                    uid, text, reply_markup=reply_markup
+                )
             except Exception as exc:
                 logger.warning("notify uid=%s failed: %s", uid, exc)
 
     @staticmethod
-    def _prompt_text(kind: str | None) -> str:
-        """Разные подсказки в зависимости от типа запрошенного кода."""
+    def _prompt_text(kind: Optional[str]) -> str:
         if kind == "password":
             return (
                 "🔐 MAX запросил <b>2FA-пароль</b>.\n"
                 "Пришлите: <code>/code <ваш_пароль></code>"
             )
-        # по умолчанию — SMS
         return (
             "🔐 MAX прислал <b>SMS-код</b>.\n"
             "Посмотрите SMS на номер MAX и пришлите: <code>/code <число></code>"
         )
 
+    @staticmethod
+    def _has_session_on_disk(cache_dir: str) -> bool:
+        """Локальная проверка на случай, если в auth_state.status ещё не
+        успел обновиться, а session-файл уже залит напрямую на сервер.
+        """
+        try:
+            p = Path(cache_dir) / "bridge.db"
+            return p.is_file()
+        except Exception:
+            return False
+
+    def _session_present(self, auth: dict) -> bool:
+        if auth.get("session_file_path"):
+            return True
+        # Фолбэк на cache_dir (владелец мог положить файл руками).
+        return self._has_session_on_disk(settings.cache_dir)
+
     async def _tick(self) -> None:
         try:
             s = await api.status()
-            # Любой успешный запрос — сбрасываем счётчик ошибок.
             self._api_error_count = 0
         except Exception as exc:
-            # api может быть не готов (cold-start). Первые N ошибок логируем
-            # warning'ом, чтобы можно было увидеть проблему в логах; дальше
-            # уходим в debug, чтобы не зашумлять.
             self._api_error_count += 1
             if self._api_error_count <= self.API_ERROR_WARN_BUDGET:
                 logger.warning(
@@ -555,15 +746,33 @@ class AuthWatcher:
             else:
                 logger.debug("auth_watcher api error: %s", exc)
             return
+
         auth = s.get("auth") or {}
         status = auth.get("status") or "unknown"
         rid = auth.get("pending_2fa_request_id")
         kind = auth.get("pending_2fa_kind") or "sms"
         last_err = (auth.get("last_error") or "").lower()
+        pending_action = auth.get("pending_action")
+        session_path = auth.get("session_file_path")
+        notify_message = auth.get("notify_message")
 
-        # Уведомляем о смене статуса (ok, need_2fa, rate_limited, unknown)
+        # 1) Сначала потребляем одноразовое уведомление от supervisor'а —
+        #    оно приоритетнее статусных сообщений, т.к. часто объясняет,
+        #    что только что произошло (session uploaded, wipe и т.п.).
+        if notify_message:
+            self._last_consumed_notify = notify_message
+            await self._notify_owner(notify_message)
+            try:
+                await api.consume_notify()
+            except Exception as exc:
+                logger.debug("consume_notify failed: %s", exc)
+            return
+
+        # 2) Реакция на смену основного статуса.
         if status != self._last_known_status:
+            prev = self._last_known_status
             self._last_known_status = status
+
             if status == "ok":
                 self._notified_request_id = None
                 await self._notify_owner("✅ MAX: вход выполнен успешно.")
@@ -579,22 +788,80 @@ class AuthWatcher:
                     "⚠️ MAX временно ограничил авторизацию." + hint +
                     "\nКак только cooldown пройдёт, я пришлю уведомление."
                 )
+            elif status == "auth_required":
+                # Главное меню — выбор способа авторизации.
+                has_session = self._session_present(auth)
+                kb = auth_choice_keyboard(
+                    show_upload=not has_session,
+                    show_session_connect=has_session,
+                )
+                await self._notify_owner(
+                    "🔐 MAX не подключён.\n"
+                    "• «🔐 SMS-авторизация» — стартовать новый Client и получить SMS.\n"
+                    + (
+                        "• «📂 Подключиться по сессии» — в кэше уже есть файл, попробуем его.\n"
+                        if has_session else
+                        "• «📎 Загрузить файл сессии» — сначала пришлите bridge.db.\n"
+                    )
+                    + "Выберите действие:",
+                    reply_markup=kb,
+                )
+            elif status == "session_attached":
+                # Владелец (или supervisor) обнаружил session-файл — ждём подтверждения.
+                kb = auth_choice_keyboard(
+                    show_upload=False,
+                    show_session_connect=True,
+                )
+                path_disp = session_path or str(
+                    Path(settings.cache_dir) / "bridge.db"
+                )
+                await self._notify_owner(
+                    f"📥 В кэше MAX обнаружен session-файл:\n<code>{_escape(path_disp)}</code>\n"
+                    "Нажмите «📂 Подключиться по сессии», чтобы войти.\n"
+                    "Или «🔐 SMS-авторизация», чтобы войти по SMS (старая сессия будет стёрта).",
+                    reply_markup=kb,
+                )
             elif status == "unknown":
-                # ВАЖНО: НЕ сбрасываем _notified_request_id на «unknown»,
-                # если есть живой pending rid — иначе при переходе статуса
-                # в unknown между двумя SMS-запросами (а max-процесс именно
-                # так делает: сначала «unknown», потом сразу «need_2fa»)
-                # мы потеряем уведомление.
                 if not rid:
                     self._notified_request_id = None
+            # prev — только для возможного расширения логирования.
+            _ = prev
+
+        # 3) На случай, если status не менялся, но rid обновился.
         elif status == "need_2fa" and rid and rid != self._notified_request_id:
-            # на случай, если status не менялся, но rid новый
             self._notified_request_id = rid
             await self._notify_owner(self._prompt_text(kind))
-        # status == "unknown" + есть rid → уведомим, если ещё не уведомляли
         elif status == "unknown" and rid and rid != self._notified_request_id:
             self._notified_request_id = rid
             await self._notify_owner(self._prompt_text(kind))
+
+        # 4) Если status=auth_required, а pending_action уже выставлен —
+        #    дадим знать, что команда принята supervisor'ом (один раз на
+        #    смену).
+        if status == "auth_required" and pending_action and pending_action != self._last_known_pending_action:
+            self._last_known_pending_action = pending_action
+            label = {
+                "sms": "📨 SMS-авторизация",
+                "session": "🔌 Подключение по сессии",
+                "cancel": "🛑 Отмена",
+            }.get(pending_action, pending_action)
+            await self._notify_owner(
+                f"⏳ Команда «{label}» принята в очередь. Жду реакции supervisor'а."
+            )
+        elif not pending_action:
+            self._last_known_pending_action = None
+
+        # 5) Следим за появлением session-файла: если путь изменился —
+        #    упомянем владельцу. Полноценное уведомление уйдёт через
+        #    status=session_attached (выставляется /admin/session/upload).
+        if session_path and session_path != self._last_known_session_path:
+            self._last_known_session_path = session_path
+            if status not in ("session_attached",):
+                await self._notify_owner(
+                    f"📂 Путь к session-файлу обновился: <code>{_escape(session_path)}</code>"
+                )
+        elif not session_path:
+            self._last_known_session_path = None
 
     async def _run(self) -> None:
         logger.info("AuthWatcher started (poll=%.1fs)", self.POLL_INTERVAL)
@@ -634,11 +901,22 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(code_command, Command("code"))
     dp.message.register(reply_command, Command("reply"))
     dp.message.register(cancel_command, Command("cancel"))
+    dp.message.register(upload_session_command, Command("upload_session"))
 
     dp.message.register(button_status, F.text == "ℹ️ Статус")
     dp.message.register(button_chats, F.text == "📚 Чаты")
     dp.message.register(button_help, F.text == "🆘 Помощь")
     dp.message.register(button_listen, F.text == "📥 Слушать MAX")
+    dp.message.register(
+        button_upload_session, F.text == "📂 Загрузить сессию MAX"
+    )
+
+    # FSM: загрузка session-файла
+    dp.message.register(
+        upload_session_file_handler,
+        UploadSessionState.waiting_file,
+        F.content_type == "document",
+    )
 
     dp.message.register(
         reply_text, ReplyState.waiting_text, F.content_type == "text"
@@ -649,11 +927,9 @@ def register_handlers(dp: Dispatcher) -> None:
         F.content_type.in_({"photo", "video", "document"}),
     )
 
-    # Когда владелец в reauth-режиме, любой не-командный текст напоминаем
-    # ввести код через /code или выйти через /cancel. Не делаем это как
-    # глобальный перехватчик-лямбду (она «глохла» обычные текстовые
-    # сообщения владельца параллельно с /code).
-
     dp.callback_query.register(reply_callback, F.callback_data.startswith("reply:"))
     dp.callback_query.register(showid_callback, F.callback_data.startswith("showid:"))
     dp.callback_query.register(history_callback, F.callback_data.startswith("history:"))
+    dp.callback_query.register(
+        auth_action_callback, AuthActionCallback.filter()
+    )

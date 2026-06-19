@@ -1,12 +1,18 @@
 """Supervisor max-процесса.
 
-- Запускает PyMax Client в фоне (own task)
-- На каждой итерации проверяет auth_state:
-  - status == "ok" → ничего не делаем
-  - status == "need_2fa" → стираем cache и пересоздаём Client (reauth)
-- При падении Client ждёт и перезапускает
-- При получении rid (от SmsCodeProvider/PasswordProvider) сам вызывает /auth/2fa/request
-  (это делают провайдеры, supervisor не вмешивается)
+Логика «только по команде»:
+- На старте НЕ создаём PyMax Client. Выставляем auth_state.status = "auth_required"
+  и ждём явной команды от владельца (через бота).
+- Supervisor крутится в цикле, опрашивая auth_state.pending_action:
+    * "sms"     — стираем cache и поднимаем Client с SmsAuthFlow
+    * "session" — не трогаем cache и поднимаем Client (PyMax прочитает bridge-файл)
+    * "cancel"  — отмена текущего действия, возврат в auth_required
+- При ошибке Client (особенно error.limit.violate) — возвращаемся в auth_required
+  с notify_message, не зацикливаемся.
+- При status=ok Client продолжает работать; supervisor не пересоздаёт его без причины.
+
+Прокси-команды от владельца бот кладёт через /auth/action
+(см. shared.db.set_pending_action / consume_pending_action).
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from pymax import Client
 from pymax.config import ExtraConfig
 from pymax.auth.sms import SmsAuthFlow
@@ -34,58 +39,6 @@ from app.sender import sender_loop
 from shared import db as shared_db
 
 logger = logging.getLogger(__name__)
-
-
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("BRIDGE_API_KEY", "")
-
-
-def _headers() -> dict:
-    return {"X-Api-Key": API_KEY}
-
-
-async def _get_auth_state() -> dict:
-    try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
-            r = await c.get("/status", headers=_headers())
-            r.raise_for_status()
-            return (r.json() or {}).get("auth") or {}
-    except Exception as exc:
-        logger.debug("get_auth_state failed: %s", exc)
-        return {}
-
-
-async def _post_auth_state(
-    status: str,
-    error: Optional[str] = None,
-    clear_error: bool = False,
-    last_login: bool = False,
-) -> None:
-    """Пробросить изменение auth_state в api.
-
-    Параметры:
-      * ``status`` — новый статус (``ok``/``need_2fa``/``rate_limited``/``unknown``).
-      * ``error`` — если не ``None``, записывается в ``last_error``.
-      * ``clear_error=True`` — сбрасывает ``last_error`` в NULL даже если
-        ``error is None``. Нужно при status=ok и при ручном reauth.
-      * ``last_login=True`` — обновить ``last_login_at`` (используется при
-        status=ok).
-    """
-    try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
-            r = await c.post(
-                "/auth/state",
-                json={
-                    "status": status,
-                    "error": error,
-                    "clear_error": clear_error,
-                    "last_login": last_login,
-                },
-                headers=_headers(),
-            )
-            r.raise_for_status()
-    except Exception as exc:
-        logger.warning("post_auth_state failed: %s", exc)
 
 
 def _wipe_cache(cache_dir: str) -> None:
@@ -285,6 +238,12 @@ async def _watch_session_file(
     понимает, что мост живой — он пытается пересоздать Client, упирается
     в ``sms-cooldown`` и сбрасывает сессию. Здесь мы сами выставляем
     ``status=ok`` по факту появления session.db на диске.
+
+    В режиме «только по команде» watcher НЕ должен ставить ``ok`` если
+    владелец ещё не дал команду (``auth_required``) или идёт процесс
+    SMS/2FA (``need_2fa``) или MAX под rate-limit (``rate_limited``).
+    Иначе мы заспойлим владельцу ложное «✅ MAX: вход выполнен успешно»
+    пока он только положил файл сессии в кэш и ещё не подтвердил.
     """
     session_path = Path(cache_dir) / "bridge"
     logger.info(
@@ -296,20 +255,32 @@ async def _watch_session_file(
     while not stop_event.is_set():
         try:
             if session_path.is_file():
+                # Свежий ли файл?
                 mtime = session_path.stat().st_mtime
-                # Файл создан ПОСЛЕ старта Client (с запасом 5с на лаги).
-                # До этого либо файла не было (мы только создали Client),
-                # либо mtime старый (прошлая сессия из cache_dir).
-                if mtime >= started_at - 5.0 and not last_posted_ok:
-                    logger.info(
-                        "session file detected (mtime=%.0f, started_at=%.0f), "
-                        "marking auth=ok",
-                        mtime, started_at,
-                    )
-                    await _post_auth_state(
-                        "ok", last_login=True, clear_error=True,
-                    )
-                    last_posted_ok = True
+                if mtime < started_at - 5.0:
+                    # Файл старый (например, лежал до старта supervisor'а).
+                    # НЕ ставим ok автоматически — пусть решает владелец.
+                    last_posted_ok = False
+                else:
+                    # Файл свежий — может ставить ok, но только если мост
+                    # реально в процессе авторизации, а не ждёт команды.
+                    current = shared_db.get_auth_state()
+                    current_status = current.get("status") or "unknown"
+                    if current_status in ("auth_required", "need_2fa", "rate_limited"):
+                        # Владелец ещё не подтвердил / идёт 2FA / rate-limit.
+                        # Watcher не должен вмешиваться.
+                        last_posted_ok = False
+                    else:
+                        if not last_posted_ok:
+                            logger.info(
+                                "session file detected (mtime=%.0f, started_at=%.0f, status=%s), "
+                                "marking auth=ok",
+                                mtime, started_at, current_status,
+                            )
+                            shared_db.set_auth_state(
+                                "ok", last_login=True, clear_error=True,
+                            )
+                            last_posted_ok = True
         except Exception as exc:
             logger.warning("session watcher error: %s", exc)
         try:
@@ -319,12 +290,30 @@ async def _watch_session_file(
 
 
 async def run() -> None:
-    """Главный цикл supervisor'а: пересоздаёт Client при необходимости."""
+    """Главный цикл supervisor'а: ждёт команды от владельца и поднимает Client.
+
+    В отличие от старой логики, Client НЕ создаётся автоматически на старте.
+    Сначала выставляем ``status=auth_required`` и ждём ``pending_action`` от
+    бота (``"sms"`` / ``"session"`` / ``"cancel"``). На каждой итерации:
+      0) Если активен rate-limit cooldown — ждём до конца.
+      1) Читаем текущее auth_state.
+      2) Если Client жив и status=ok — ждём (мост работает).
+      3) Если Client жив и status не ok — ждём (идёт авторизация / 2FA).
+      4) Если Client умер — закрываем и обрабатываем ошибку (rate-limit → в
+         auth_required с notify_message, прочие auth-ошибки → то же).
+      5) Если status=ok, но Client'а нет — не пересоздаём автоматически,
+         ждём (такого в норме быть не должно).
+      6) Читаем pending_action. Если нет — ждём.
+      7) Обрабатываем action:
+           * "cancel"  → status=auth_required
+           * "sms"     → wipe_cache, status=unknown, build_client
+           * "session" → проверяем файл, status=session_attached, build_client
+    """
     phone = os.getenv("MAX_PHONE", "")
     cache_dir = os.getenv("CACHE_DIR", "/data/cache")
     if not phone:
         logger.error("MAX_PHONE не задан, supervisor не может работать")
-        await _post_auth_state("unknown", "MAX_PHONE env is empty")
+        shared_db.set_auth_state("unknown", error="MAX_PHONE env is empty")
         return
 
     stop_event = asyncio.Event()
@@ -333,22 +322,67 @@ async def run() -> None:
     sender_task: Optional[asyncio.Task] = None
     drain_task: Optional[asyncio.Task] = None
     session_task: Optional[asyncio.Task] = None
-    last_reauth_signal: Optional[str] = None  # анти-дубль: реагируем только на СМЕНУ need_2fa
-    last_sms_request_at: float = 0.0         # анти-спам: время последнего create_client для need_2fa
-    last_start_failed: bool = False          # только что был неудачный start() — нужен backoff
-    rate_limit_until: float = 0.0            # глобальный cooldown: до этого moment не дёргаем api
+    rate_limit_until: float = 0.0
+    last_sms_request_at: float = 0.0
+
+    # === Стартовая инициализация: режим «только по команде» ===
+    initial = shared_db.get_auth_state()
+    initial_status = initial.get("status") or "unknown"
+    initial_session_present = bool(initial.get("session_file_path")) or (
+        Path(cache_dir) / "bridge"
+    ).is_file()
+
+    if initial_status == "ok" and initial_session_present:
+        # Тёплый запуск с валидной сессией. Всё равно требуем явного
+        # подтверждения — выставляем auth_required, чтобы бот показал
+        # inline-меню «Подключиться по сессии / SMS». Сессию на диске
+        # НЕ трогаем.
+        shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+        shared_db.set_notify_message(
+            "🔁 Найдена сохранённая сессия MAX. Подтвердите подключение: "
+            "«📂 Подключиться по сессии» или начните заново через «🔐 SMS-авторизация»."
+        )
+        logger.info(
+            "warm start: session present and status=ok → auth_required, waiting for owner"
+        )
+    elif initial_status in ("unknown", "rate_limited", "ok"):
+        # Холодный запуск или восстановление после rate-limit/ok-without-session.
+        if initial_status != "auth_required":
+            shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+        shared_db.set_notify_message(
+            "🆕 MAX-мост запущен. Выберите способ авторизации: «🔐 SMS-авторизация» "
+            "или «📂 Подключиться по сессии» (если она уже загружена)."
+        )
+        logger.info(
+            "cold start: status=%s → auth_required, waiting for owner", initial_status
+        )
+    elif initial_status == "need_2fa":
+        # Рестарт во время ожидания кода. Сбрасываем, чтобы владелец
+        # начал авторизацию заново.
+        logger.info("restart during need_2fa: clearing state, returning to auth_required")
+        shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+        shared_db.set_notify_message(
+            "⚠️ MAX-мост перезапущен во время ожидания кода. "
+            "Выберите действие заново: «🔐 SMS-авторизация» или «📂 Подключиться по сессии»."
+        )
+    elif initial_status == "session_attached":
+        # Владелец загрузил сессию, но Client ещё не запускался.
+        logger.info("session_attached on start: waiting for owner confirm")
+        shared_db.set_notify_message(
+            "📂 Сессия MAX загружена в кэш. Подтвердите подключение через бота."
+        )
+    # auth_required — оставляем, владелец уже в процессе выбора.
 
     # Запускаем drain system_state — без него мост мёртв (см. _drain_2fa_codes_loop).
     drain_task = asyncio.create_task(_drain_2fa_codes_loop(stop_event), name="2fa-drain")
-    # Следим за session.db на диске — как только он появится/обновится,
-    # переводим auth_state в ok (см. _watch_session_file).
+    # Следим за session.db на диске — fallback для _on_start (см. _watch_session_file).
     session_task = asyncio.create_task(
         _watch_session_file(stop_event, cache_dir, phone), name="session-watcher",
     )
 
     try:
         while not stop_event.is_set():
-            # 0) Если активен глобальный rate-limit — ждём до его окончания.
+            # 0) Глобальный rate-limit cooldown
             now = time.monotonic()
             if rate_limit_until > 0 and now < rate_limit_until:
                 wait = rate_limit_until - now
@@ -359,38 +393,44 @@ async def run() -> None:
                 await _sleep_with_stop(stop_event, wait)
                 if stop_event.is_set():
                     break
+                continue
             elif rate_limit_until > 0 and now >= rate_limit_until:
-                # cooldown истёк — сбрасываем флаг, чтобы бот узнал о возврате
                 logger.info("rate-limit cooldown elapsed, resuming")
                 rate_limit_until = 0.0
                 # clear_error=True, чтобы прошлая rate-limit-ошибка не висела в /status
-                await _post_auth_state("unknown", error=None, clear_error=True)
+                shared_db.set_auth_state("auth_required", error=None, clear_error=True)
 
-            # 1) Проверим, не сигналил ли бот reauth
-            auth = await _get_auth_state()
+            # 1) Текущее состояние
+            auth = shared_db.get_auth_state()
             status = auth.get("status") or "unknown"
-            need_reauth = (
-                status == "need_2fa" and (auth.get("last_error") or "").startswith("reauth requested")
-            )
-            # Свежий «reauth requested» — сбрасываем кэш и сразу
-            # пересоздаём Client в этом же цикле, не дожидаясь
-            # NORMAL_POLL_SECONDS (30s) следующей итерации.
-            sig = f"{status}|{auth.get('last_error') or ''}"
-            if need_reauth and sig != last_reauth_signal:
-                last_reauth_signal = sig
-                # Забываем прошлые rid'ы: после wipe_cache и рестарта Client'а
-                # провайдеры заведут новые, и старые ключи в system_state
-                # (если они там случайно залипли) уже не должны будить Event'ы.
-                _ALREADY_NOTIFIED.clear()
-                logger.warning("reauth requested by owner, wiping cache and recreating client")
-                # Остановим текущий client, если жив
-                if client_task is not None and not client_task.done():
-                    client_task.cancel()
-                    try:
-                        await client_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    client_task = None
+            session_path = Path(cache_dir) / "bridge"
+            has_session_file = session_path.is_file()
+
+            # 2) Client жив и status=ok — мост работает, ничего не делаем
+            if client_task is not None and not client_task.done() and status == "ok":
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # 3) Client жив, но статус ещё не ok (need_2fa / unknown / session_attached)
+            #    — идёт авторизация, не дёргаем api.oneme.ru
+            if client_task is not None and not client_task.done():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # 4) Client'а нет или он умер — разбираемся
+            if client_task is not None and client_task.done():
+                exc: Optional[BaseException] = None
+                try:
+                    exc = client_task.exception()
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    exc = None
+                # Закрываем sender и client
                 if sender_task is not None and not sender_task.done():
                     sender_task.cancel()
                     try:
@@ -404,136 +444,160 @@ async def run() -> None:
                     except Exception:
                         pass
                 client = None
-                _wipe_cache(cache_dir)
-                # Сменим sig, чтобы следующий запуск Client прошёл как «нормальный».
-                # clear_error=True, чтобы маркер «reauth requested by owner»
-                # не висел в /status после того, как supervisor отреагировал.
-                await _post_auth_state("unknown", error=None, clear_error=True)
-                status = "unknown"
-                # Сбросим sms-cooldown и last_start_failed, чтобы не ждать
-                # ещё 15 минут после явного reauth от владельца.
-                last_sms_request_at = 0.0
-                last_start_failed = False
-                # НЕ возвращаемся в конец цикла — следующий блок (2) сам
-                # подхватит client_task is None и создаст Client немедленно.
+                client_task = None
 
-            # 2) Создаём Client, если его нет или он мёртв
-            if client_task is None or client_task.done():
-                # ВАЖНО: если мост уже авторизован (status=ok) и сессия на диске,
-                # НЕ пересоздаём Client. PyMax после первой синхронизации MAX
-                # закрывает соединение, и ``client.start()`` корректно возвращается
-                # (``pymax.app: client started`` → ``closing connection`` →
-                # ``start() return``). Это нормальное поведение, а не падение.
-                # Без этой проверки supervisor пересоздаёт Client раз в 30 секунд,
-                # MAX шлёт новый SMS, и мост зацикливается в reauth/sms-cooldown.
-                _auth_now = await _get_auth_state()
-                _status_now = _auth_now.get("status") or "unknown"
-                _session_path = Path(cache_dir) / "bridge"
-                if _status_now == "ok" and _session_path.is_file():
-                    if client_task is not None and client_task.done() and client_task.exception() is None:
-                        logger.debug(
-                            "pymax exited cleanly after auth (status=ok, session present); "
-                            "not recreating client",
+                if exc is not None:
+                    logger.warning("client_task exited with error: %s", exc)
+                    if _is_rate_limit_error(exc):
+                        # Возвращаемся в auth_required с notify_message и длинным cooldown
+                        rate_limit_until = time.monotonic() + RATE_LIMIT_BACKOFF
+                        shared_db.set_auth_state(
+                            "auth_required", error=str(exc), clear_error=False,
                         )
-                    else:
-                        logger.debug(
-                            "status=ok and session present; not recreating client",
+                        shared_db.set_notify_message(
+                            f"⚠️ MAX ограничил авторизацию (error.limit.violate). "
+                            f"Мост возвращён в режим ожидания команды. "
+                            f"Повторная попытка возможна через {RATE_LIMIT_BACKOFF/60:.0f} мин."
                         )
-                    try:
-                        await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
-                        break
-                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "rate-limit hit, returning to auth_required; cooldown=%.0fs",
+                            RATE_LIMIT_BACKOFF,
+                        )
+                        await _sleep_with_stop(stop_event, RATE_LIMIT_BACKOFF)
+                        if stop_event.is_set():
+                            break
                         continue
-
-                # Anti-spam: если мы только что провалили старт — подождём подольше
-                if last_start_failed:
-                    logger.info(
-                        "backing off %.0fs before recreating pymax client (last start failed)",
-                        AUTH_FAIL_BACKOFF,
+                    else:
+                        # Любая другая ошибка — тоже возвращаемся в auth_required
+                        shared_db.set_auth_state(
+                            "auth_required", error=str(exc), clear_error=False,
+                        )
+                        shared_db.set_notify_message(
+                            f"❌ Ошибка клиента MAX: {exc}. "
+                            f"Мост возвращён в режим ожидания команды."
+                        )
+                        await _sleep_with_stop(stop_event, AUTH_FAIL_BACKOFF)
+                        if stop_event.is_set():
+                            break
+                        continue
+                else:
+                    # exc is None — _long_running_start сам вышел (странно,
+                    # в норме она крутится вечно). Не пересоздаём Client
+                    # автоматически — ждём команду.
+                    logger.warning(
+                        "client_task exited cleanly without exception; "
+                        "returning to auth_required and waiting for owner"
                     )
-                    await _sleep_with_stop(stop_event, AUTH_FAIL_BACKOFF)
-                    if stop_event.is_set():
-                        break
-                    last_start_failed = False
+                    shared_db.set_auth_state(
+                        "auth_required",
+                        error="client exited unexpectedly",
+                        clear_error=True,
+                    )
+                    shared_db.set_notify_message(
+                        "⚠️ Клиент MAX неожиданно завершился. Выберите действие: "
+                        "«🔐 SMS-авторизация» или «📂 Подключиться по сессии»."
+                    )
+                    continue
 
-                # Anti-spam: не создаём новый Client чаще, чем раз в SMS_RESEND_COOLDOWN,
-                # чтобы не молотить api.oneme.ru SMS-запросами.
+            # 5) Client'а нет, status=ok (был, но Client умер; в норме такого
+            #    быть не должно, т.к. _long_running_start крутится вечно).
+            #    Не пересоздаём автоматически, ждём команду.
+            if status == "ok":
+                logger.debug(
+                    "status=ok but client_task is None; not recreating (waiting for owner)"
+                )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # 6) Client'а нет, status не ok — читаем pending_action
+            action = shared_db.consume_pending_action()
+            if not action:
+                # Нет команды — supervisor бездействует, ждём
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # 7) Обрабатываем команду
+            if action == "cancel":
+                logger.info("owner requested cancel; returning to auth_required")
+                shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+                shared_db.set_notify_message(
+                    "⛔ Действие отменено владельцем. Мост ожидает новую команду."
+                )
+                continue
+
+            if action == "sms":
+                # Anti-spam: не дёргаем MAX чаще, чем раз в SMS_RESEND_COOLDOWN
                 now = time.monotonic()
-                if now - last_sms_request_at < SMS_RESEND_COOLDOWN and last_sms_request_at > 0:
+                if last_sms_request_at > 0 and now - last_sms_request_at < SMS_RESEND_COOLDOWN:
                     wait = SMS_RESEND_COOLDOWN - (now - last_sms_request_at)
                     logger.info(
                         "sms-cooldown active, waiting %.0fs before next pymax start",
                         max(0.0, wait),
                     )
+                    shared_db.set_notify_message(
+                        f"⏳ Слишком частые SMS-запросы к MAX. "
+                        f"Повторная попытка через {max(0.0, wait)/60:.1f} мин."
+                    )
                     await _sleep_with_stop(stop_event, max(0.0, wait))
                     if stop_event.is_set():
                         break
-
-                logger.info("creating PyMax client (status=%s)", status)
+                    continue
                 last_sms_request_at = time.monotonic()
+
+                logger.info("owner requested SMS auth; wiping cache and starting client")
+                _wipe_cache(cache_dir)
+                shared_db.set_auth_state("unknown", error=None, clear_error=True)
+                shared_db.set_notify_message("🔐 Запрашиваю SMS-код у MAX…")
                 client = build_client(phone, cache_dir)
-                # Используем _long_running_start вместо прямого client.start(),
-                # чтобы PyMax не возвращался через ``else: return`` после первой
-                # синхронизации. Wrapper сам переинициализирует runtime и
-                # реконнектится. client_task никогда не завершается чисто.
                 client_task = asyncio.create_task(
                     _long_running_start(client, stop_event), name="pymax-client",
                 )
-                sender_task = asyncio.create_task(sender_loop(client, stop_event), name="pymax-sender")
-                # ВАЖНО: client.start() — fire-and-forget. Нельзя делать
-                # ``await asyncio.wait_for(client_task, timeout=...)`` — это
-                # **отменяет** таску по таймауту и убивает SmsAuthFlow.authenticate
-                # посреди ``await code_provider.get_code(...)``. В итоге Client
-                # закрывается раньше, чем MAX получит наш код, и до 2FA-фазы дело
-                # не доходит. Вместо этого спим 2 секунды через stop_event
-                # (без отмены client_task) и потом проверяем, не упала ли таска.
+                sender_task = asyncio.create_task(
+                    sender_loop(client, stop_event), name="pymax-sender",
+                )
+                # Дать Client'у 2с на мгновенный краш (например, error.limit.violate
+                # сразу из on_start). Обработаем на следующей итерации.
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=2.0)
-                    # stop_event выставлен — выходим из run() через finally
                     break
                 except asyncio.TimeoutError:
                     pass
-
-                # Моментальный эксепшен (например, MAX сразу вернул
-                # error.limit.violate из on_start) — обработаем как раньше.
-                if client_task.done():
-                    exc: Optional[BaseException] = None
-                    try:
-                        exc = client_task.exception()
-                    except (asyncio.CancelledError, asyncio.InvalidStateError):
-                        exc = None
-                    if exc is not None:
-                        last_start_failed = True
-                        # rate-limit — особый случай: даём длинный бэкофф
-                        # и ставим глобальный rate_limit_until, чтобы следующий
-                        # цикл не дёрнул api.oneme.ru снова сразу после sleep'а.
-                        if _is_rate_limit_error(exc):
-                            rate_limit_until = time.monotonic() + RATE_LIMIT_BACKOFF
-                            logger.warning(
-                                "rate-limit hit, backing off %.0fs (err=%s)",
-                                RATE_LIMIT_BACKOFF,
-                                exc,
-                            )
-                            await _post_auth_state("rate_limited", error=str(exc))
-                            await _sleep_with_stop(stop_event, RATE_LIMIT_BACKOFF)
-                            if stop_event.is_set():
-                                break
-                        else:
-                            logger.warning("client.start() exited: %s", exc)
-                            # статус авторизации мог не выставиться — пробуем
-                            # отметит need_2fa
-                            if _is_auth_error(exc):
-                                await _post_auth_state("need_2fa", error=str(exc))
-                            else:
-                                await _post_auth_state("unknown", error=str(exc))
-
-            # 3) Подождём перед следующей итерацией
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=NORMAL_POLL_SECONDS)
-                # stop_event выставлен — выходим
-                break
-            except asyncio.TimeoutError:
                 continue
+
+            if action == "session":
+                logger.info("owner requested attach by saved session")
+                if not has_session_file:
+                    shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+                    shared_db.set_notify_message(
+                        "❌ Файл сессии не найден в кэше. Сначала загрузите его "
+                        "через бота (кнопка «📂 Загрузить сессию MAX»)."
+                    )
+                    continue
+                shared_db.set_auth_state("session_attached", error=None, clear_error=True)
+                shared_db.set_notify_message("📂 Подключаюсь по сохранённой сессии…")
+                client = build_client(phone, cache_dir)
+                client_task = asyncio.create_task(
+                    _long_running_start(client, stop_event), name="pymax-client",
+                )
+                sender_task = asyncio.create_task(
+                    sender_loop(client, stop_event), name="pymax-sender",
+                )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            # Неизвестный action — игнорируем
+            logger.warning("unknown pending_action=%r, ignoring", action)
+            continue
 
     finally:
         # shutdown

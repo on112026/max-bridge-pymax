@@ -85,5 +85,63 @@ class BotApi:
             r.raise_for_status()
             return r.json()["request_id"]
 
+    async def post_auth_action(self, action: str) -> Dict[str, Any]:
+        """Команда от владельца supervisor'у: 'sms' | 'session' | 'cancel'.
+
+        Бот вызывает этот метод после нажатия inline-кнопки «🔐 SMS» /
+        «📂 Подключиться по сессии» / «⛔ Отмена». Supervisor на следующей
+        итерации заберёт ``pending_action`` и обработает.
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=10.0
+        ) as c:
+            r = await c.post(
+                "/auth/action",
+                json={"action": action},
+                headers=self._client._headers(),
+            )
+            r.raise_for_status()
+            return r.json() if r.content else {"ok": True}
+
+    async def consume_notify(self) -> Dict[str, Any]:
+        """Сбросить одноразовое ``auth_state.notify_message`` в api.
+
+        AuthWatcher вызывает этот метод после того, как переслал
+        ``notify_message`` владельцу. Без этого поле будет приходить
+        в каждом ``/status`` (раз в 3 секунды), и бот будет спамить.
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=5.0
+        ) as c:
+            r = await c.post(
+                "/auth/notify/consume",
+                headers=self._client._headers(),
+            )
+            r.raise_for_status()
+            return r.json() if r.content else {"ok": True}
+
+    async def upload_session_file(
+        self,
+        file_bytes: bytes,
+        filename: str = "bridge.db",
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        """Отправить загруженный владельцем session-файл MAX в api.
+
+        Файл сохраняется в ``CACHE_DIR/bridge.db`` (PyMax session), а
+        ``auth_state`` переводится в ``session_attached`` — supervisor
+        ждёт явной команды «Подключиться по сессии».
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=120.0
+        ) as c:
+            r = await c.post(
+                "/admin/session/upload",
+                files={"file": (filename, file_bytes, content_type)},
+                headers=self._client._headers(),
+            )
+            r.raise_for_status()
+            return r.json() if r.content else {"ok": True}
+
 
 api = BotApi()

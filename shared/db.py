@@ -83,16 +83,43 @@ class SendQueue(Base):
 
 
 class AuthState(Base):
-    """Текущее состояние авторизации MAX."""
+    """Текущее состояние авторизации MAX.
+
+    Возможные ``status``:
+      * ``ok``              — сессия валидна, мост работает.
+      * ``need_2fa``        — MAX прислал запрос на SMS/пароль, ждём /code.
+      * ``rate_limited``    — MAX ограничил запросы (``error.limit.violate``).
+      * ``auth_required``   — нет валидной сессии; supervisor НИЧЕГО не делает,
+                              пока владелец не пришлёт команду через бота
+                              (см. ``pending_action``).
+      * ``session_attached``— владелец вручную положил session-файл в кэш,
+                              supervisor ещё не пробовал подключаться.
+      * ``unknown``         — стартовое состояние.
+
+    ``pending_action`` — команда от владельца, которую supervisor должен
+    выполнить на следующей итерации:
+      * ``"sms"``     — поднять Client, начать SMS-авторизацию.
+      * ``"session"`` — поднять Client, попробовать по сохранённой сессии.
+      * ``"cancel"``  — отменить текущее действие.
+      * ``NULL``      — действий нет, supervisor ждёт.
+    """
 
     __tablename__ = "auth_state"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    status = Column(String, default="unknown", index=True)  # ok, need_2fa, need_reauth, rate_limited, unknown
+    status = Column(String, default="unknown", index=True)
     pending_2fa_request_id = Column(Integer, nullable=True)
     pending_2fa_kind = Column(String, nullable=True)  # "sms" | "password" | None
     last_2fa_request_at = Column(DateTime, nullable=True)
     last_login_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
+    # Команда от владельца для supervisor'а (см. docstring выше).
+    pending_action = Column(String, nullable=True)
+    # Путь к загруженному session-файлу (если владелец делал upload).
+    session_file_path = Column(String, nullable=True)
+    # Сообщение для бота, которое надо показать владельцу при следующем тике
+    # AuthWatcher (например, "session uploaded, size=12345"). После показа
+    # supervisor/bot сами очищают, чтобы не дёргать повторно.
+    notify_message = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -425,8 +452,79 @@ def get_auth_state() -> dict:
             "last_2fa_request_at": row.last_2fa_request_at,
             "last_login_at": row.last_login_at,
             "last_error": row.last_error,
+            # Новые поля (модель «только по команде»).
+            "pending_action": row.pending_action,
+            "session_file_path": row.session_file_path,
+            "notify_message": row.notify_message,
             "updated_at": row.updated_at,
         }
+
+
+def set_pending_action(action: Optional[str]) -> None:
+    """Поставить (или сбросить) команду от владельца для supervisor'а.
+
+    ``action`` — ``"sms"`` / ``"session"`` / ``"cancel"`` / ``None``.
+    Используется ботом (и API) для передачи команды supervisor'у.
+    """
+    with session_scope() as s:
+        row = s.query(AuthState).first()
+        if not row:
+            row = AuthState(status="unknown")
+            s.add(row)
+        row.pending_action = action
+        row.updated_at = datetime.utcnow()
+
+
+def consume_pending_action() -> Optional[str]:
+    """Забрать текущую команду от владельца (и сбросить в NULL).
+
+    Вызывается supervisor'ом после того, как он начал её обрабатывать.
+    Возвращает ``"sms"`` / ``"session"`` / ``"cancel"`` / ``None``.
+    """
+    with session_scope() as s:
+        row = s.query(AuthState).first()
+        if not row:
+            return None
+        action = row.pending_action
+        row.pending_action = None
+        return action
+
+
+def set_notify_message(text: Optional[str]) -> None:
+    """Положить одноразовое сообщение для AuthWatcher (бота).
+
+    AuthWatcher заберёт его через ``consume_notify_message`` и сразу очистит,
+    чтобы не показывать повторно.
+    """
+    with session_scope() as s:
+        row = s.query(AuthState).first()
+        if not row:
+            row = AuthState(status="unknown")
+            s.add(row)
+        row.notify_message = text
+        row.updated_at = datetime.utcnow()
+
+
+def consume_notify_message() -> Optional[str]:
+    """Забрать (и сбросить) одноразовое сообщение для AuthWatcher."""
+    with session_scope() as s:
+        row = s.query(AuthState).first()
+        if not row:
+            return None
+        msg = row.notify_message
+        row.notify_message = None
+        return msg
+
+
+def set_session_file_path(path: Optional[str]) -> None:
+    """Запомнить путь к загруженному session-файлу (или сбросить)."""
+    with session_scope() as s:
+        row = s.query(AuthState).first()
+        if not row:
+            row = AuthState(status="unknown")
+            s.add(row)
+        row.session_file_path = path
+        row.updated_at = datetime.utcnow()
 
 
 def set_auth_state(

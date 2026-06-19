@@ -2,12 +2,19 @@
 
 Без VNC, без headful-прокси, без watcher'а — все 2FA/SMS происходят
 через PyMax SmsAuthFlow, а коды владелец вводит в Telegram-боте.
+
+Модель авторизации «только по команде»: на cold-start supervisor ставит
+``auth_state.status = auth_required`` и НЕ создаёт PyMax Client. Владелец
+через бота нажимает inline-кнопку, и только тогда бот кладёт
+``pending_action`` в БД (эндпоинт ``/auth/action``), а supervisor
+обрабатывает его на следующей итерации.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -19,7 +26,7 @@ sys.path.insert(0, str(ROOT / "api"))
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -370,6 +377,130 @@ def peek_2fa(request_id: int) -> TwoFaCodeOut:
     if code is not None:
         db.clear_2fa_request()
     return TwoFaCodeOut(code=code)
+
+
+# ---------- Команда авторизации от владельца (только по явному действию) ----------
+
+
+class AuthActionIn(BaseModel):
+    """Команда от бота (владельца) supervisor'у.
+
+    ``action``:
+      * ``"sms"``     — поднять Client, начать SMS-авторизацию.
+      * ``"session"`` — поднять Client, попробовать по сохранённой сессии.
+      * ``"cancel"``  — отменить текущее действие и вернуться в ``auth_required``.
+    """
+
+    action: str
+
+
+class AuthActionOut(BaseModel):
+    ok: bool = True
+    pending_action: Optional[str] = None
+
+
+@app.post("/auth/action", response_model=AuthActionOut, dependencies=[Depends(verify_api_key)])
+def post_auth_action(body: AuthActionIn) -> AuthActionOut:
+    action = (body.action or "").strip().lower()
+    if action not in ("sms", "session", "cancel"):
+        raise HTTPException(status_code=400, detail="action must be 'sms' | 'session' | 'cancel'")
+    db.set_pending_action(action)
+    logger.info("auth action queued: %s", action)
+    return AuthActionOut(ok=True, pending_action=action)
+
+
+# ---------- Одноразовое уведомление для бота (consume) ----------
+
+
+class NotifyOut(BaseModel):
+    ok: bool = True
+    message: Optional[str] = None
+
+
+@app.post("/auth/notify/consume", response_model=NotifyOut, dependencies=[Depends(verify_api_key)])
+def post_auth_notify_consume() -> NotifyOut:
+    """Забрать (и сбросить) одноразовое ``auth_state.notify_message``.
+
+    AuthWatcher в боте вызывает этот эндпоинт после того, как переслал
+    сообщение владельцу — иначе оно будет показываться на каждом тике
+    (3 секунды). Без отдельного эндпоинта бот не может сбросить поле
+    (SQLAlchemy-сессия живёт только в api-процессе).
+    """
+    msg = db.consume_notify_message()
+    return NotifyOut(ok=True, message=msg)
+
+
+# ---------- Загрузка session-файла MAX владельцем ----------
+
+
+class SessionUploadOut(BaseModel):
+    ok: bool = True
+    path: str
+    size: int
+
+
+@app.post("/admin/session/upload", response_model=SessionUploadOut, dependencies=[Depends(verify_api_key)])
+async def post_session_upload(file: UploadFile = File(...)) -> SessionUploadOut:
+    """Владелец через бота загружает ``bridge.db`` (PyMax session).
+
+    Файл сохраняется в ``CACHE_DIR/bridge.db``. ``.db-shm``/``.db-wal`` (если
+    были) стираются, чтобы PyMax при следующем старте не подцепил старый WAL
+    с устаревшими данными. Supervisor увидит файл через session-watcher и
+    перейдёт в режим ``session_attached``, ожидая команды «Подключиться».
+    """
+    cache_dir = Path(settings.cache_dir)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"cache_dir not writable: {exc}")
+
+    # Ограничим размер (50 МБ) — больше у PyMax всё равно не бывает.
+    MAX_SIZE = 50 * 1024 * 1024
+    target = cache_dir / "bridge.db"
+    try:
+        # Стираем старые sqlite-sidecar'ы (shm/wal), иначе PyMax может
+        # прочитать устаревший WAL от прошлой сессии.
+        for sidecar in (cache_dir / "bridge.db-shm", cache_dir / "bridge.db-wal"):
+            if sidecar.exists():
+                try:
+                    sidecar.unlink()
+                except OSError:
+                    pass
+        # Атомарная запись: пишем во временный файл, затем переименовываем.
+        tmp_path = target.with_suffix(target.suffix + ".upload")
+        written = 0
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_SIZE:
+                    f.close()
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=413, detail="file too large (>50 MB)")
+                f.write(chunk)
+        os.replace(tmp_path, target)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"upload failed: {exc}")
+
+    db.set_session_file_path(str(target))
+    # Сообщим AuthWatcher'у, что надо показать inline-меню «Подключиться / Отменить».
+    db.set_notify_message(
+        f"📥 Принят session-файл ({written} байт). Сохранён в {target}. "
+        "Можно подключаться."
+    )
+    # Автоматически переведём в session_attached, если ещё не в нём.
+    state = db.get_auth_state()
+    if state.get("status") in ("auth_required", "unknown", None):
+        db.set_auth_state("session_attached", clear_error=True)
+    logger.info("session uploaded: path=%s size=%d", target, written)
+    return SessionUploadOut(ok=True, path=str(target), size=written)
 
 
 # ---------- Внутренние уведомления (опционально, для отладки) ----------

@@ -14,3 +14,11 @@ class ReauthSmsState(StatesGroup):
     """Состояние владельца после /reauth_sms: ждём /code <число>."""
 
     waiting_code = State()
+
+
+class UploadSessionState(StatesGroup):
+    """Состояние владельца после нажатия «📂 Загрузить сессию MAX» или
+    inline-кнопки «📂 Прислать файл»: ждём ``document`` с session.db.
+    """
+
+    waiting_file = State()
