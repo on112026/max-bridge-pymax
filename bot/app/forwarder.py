@@ -48,11 +48,15 @@ class EventPoller:
         events: List[Dict[str, Any]] = await api.list_undelivered(limit=50)
         for ev in events:
             try:
-                await forward_event(self.bot, self.target_chat_id, ev)
-                await self.bot.send_message(
-                    chat_id=self.target_chat_id,
-                    text="—",
-                    reply_markup=event_inline_keyboard(ev.get("id", 0), ev.get("max_chat_id", "")),
+                # Inline-клавиатура прикрепляется прямо к сообщению
+                # с самим событием (текст/медиа), а не отдельным
+                # сообщением «—» — иначе кнопки «отваливаются»
+                # от контекста и через 48ч Telegram запрещает на них нажимать.
+                kb = event_inline_keyboard(
+                    ev.get("id", 0), ev.get("max_chat_id", "")
+                )
+                await forward_event(
+                    self.bot, self.target_chat_id, ev, reply_markup=kb
                 )
                 await api.mark_delivered(ev["id"])
             except Exception as exc:
