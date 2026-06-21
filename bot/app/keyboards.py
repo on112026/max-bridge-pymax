@@ -25,7 +25,10 @@ def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
                 types.KeyboardButton(text="🆘 Помощь"),
                 types.KeyboardButton(text="🔐 /reauth_sms"),
             ],
-            [types.KeyboardButton(text="📂 Загрузить сессию MAX")],
+            [
+                types.KeyboardButton(text="📋 Сессии"),
+                types.KeyboardButton(text="📂 Загрузить сессию MAX"),
+            ],
         ],
         resize_keyboard=True,
         selective=True,

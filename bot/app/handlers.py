@@ -659,6 +659,59 @@ async def session_use_callback(callback: types.CallbackQuery) -> None:
         await callback.message.answer(f"❌ Не удалось использовать сессию: {exc}")
 
 
+async def sessions_refresh_callback(callback: types.CallbackQuery) -> None:
+    """Обработчик inline-кнопки «🔄 Обновить список» под /sessions.
+
+    Перезапрашивает список session-файлов и редактирует текущее сообщение.
+    """
+    if not callback.from_user or not _is_allowed(callback.from_user.id):
+        return await callback.answer("⛔", show_alert=True)
+
+    await callback.answer("🔄 Обновляю...")
+
+    try:
+        data = await api.get_session_list()
+    except Exception as exc:
+        logger.warning("sessions_refresh failed: %s", exc)
+        await callback.message.answer(f"❌ Не удалось получить список сессий: {exc}")
+        return
+
+    if not data or not data.get("sessions"):
+        await callback.message.answer("📭 В кэше нет сохранённых session-файлов.")
+        return
+
+    sessions = data["sessions"]
+    current = data.get("current")
+
+    text = "📂 **Доступные session-файлы:**\n\n"
+    for s in sessions[:15]:
+        size_kb = s["size"] // 1024
+        mod_time = ""
+        if s.get("modified"):
+            from datetime import datetime
+            dt = datetime.fromtimestamp(s["modified"])
+            mod_time = f" • {dt.strftime('%d.%m %H:%M')}"
+
+        current_mark = " ✅ **ТЕКУЩАЯ**" if current and s["path"] == current else ""
+        text += f"• `{s['name']}` ({size_kb} КБ){mod_time}{current_mark}\n"
+
+    text += f"\n**Всего:** {len(sessions)} файл(ов)"
+
+    kb = session_use_keyboard([s["name"] for s in sessions[:8]])
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        # Если сообщение нельзя редактировать (например, нет текста) — шлём новое.
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def button_sessions(message: types.Message) -> None:
+    """Обработчик reply-кнопки «📋 Сессии»."""
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+    await sessions_command(message)
+
+
 # ---------- Inline: auth:sms / auth:session / auth:upload / auth:cancel ----------
 
 
@@ -788,10 +841,21 @@ class AuthWatcher:
     def _has_session_on_disk(cache_dir: str) -> bool:
         """Локальная проверка на случай, если в auth_state.status ещё не
         успел обновиться, а session-файл уже залит напрямую на сервер.
+
+        Проверяем не только ``bridge.db``, но и любой ``*.db`` в кэше
+        (владелец мог положить файл с произвольным именем).
         """
         try:
             p = Path(cache_dir) / "bridge.db"
-            return p.is_file()
+            if p.is_file():
+                return True
+            cache = Path(cache_dir)
+            if not cache.is_dir():
+                return False
+            for cand in cache.glob("*.db"):
+                if cand.is_file() and not cand.name.endswith(("-shm", "-wal")):
+                    return True
+            return False
         except Exception:
             return False
 
@@ -980,6 +1044,7 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(
         button_upload_session, F.text == "📂 Загрузить сессию MAX"
     )
+    dp.message.register(button_sessions, F.text == "📋 Сессии")
 
     # FSM: загрузка session-файла
     dp.message.register(
@@ -1002,6 +1067,9 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(history_callback, F.callback_data.startswith("history:"))
     dp.callback_query.register(
         session_use_callback, F.callback_data.startswith("session_use:")
+    )
+    dp.callback_query.register(
+        sessions_refresh_callback, F.callback_data == "sessions_refresh"
     )
     dp.callback_query.register(
         auth_action_callback, AuthActionCallback.filter()

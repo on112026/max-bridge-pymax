@@ -57,6 +57,41 @@ def _wipe_cache(cache_dir: str) -> None:
     logger.warning("cache wiped: %s", cache_dir)
 
 
+def _find_session_files(cache_dir: str) -> list[Path]:
+    """Ищет файлы-кандидаты на PyMax session в ``cache_dir``.
+
+    Учитывает:
+      * ``bridge`` (без расширения) — PyMax при ``session_name="bridge"``
+        пишет сюда;
+      * ``bridge.db`` — используется в API-эндпоинтах;
+      * любые другие ``*.db`` — владелец мог положить session с
+        произвольным именем.
+
+    Возвращает список существующих файлов (исключая ``-shm``/``-wal``
+    sidecar'ы), отсортированный по mtime (свежие первыми).
+    """
+    p = Path(cache_dir)
+    if not p.is_dir():
+        return []
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for name in ("bridge", "bridge.db"):
+        f = p / name
+        if f.is_file() and f not in seen:
+            candidates.append(f)
+            seen.add(f)
+    for cand in p.glob("*.db"):
+        if cand.name.endswith(("-shm", "-wal", "-journal")):
+            continue
+        if cand in seen:
+            continue
+        if cand.is_file():
+            candidates.append(cand)
+            seen.add(cand)
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return candidates
+
+
 async def _long_running_start(client: Client, stop_event: asyncio.Event) -> None:
     """Обёртка вокруг ``client.start()``, которая держит Client живым.
 
@@ -244,19 +279,52 @@ async def _watch_session_file(
     SMS/2FA (``need_2fa``) или MAX под rate-limit (``rate_limited``).
     Иначе мы заспойлим владельцу ложное «✅ MAX: вход выполнен успешно»
     пока он только положил файл сессии в кэш и ещё не подтвердил.
+
+    Дополнительно: если на диске нашёлся ``.db`` с произвольным именем
+    (владелец положил руками), и в ``auth_state.session_file_path`` пусто —
+    выставляем ``session_attached`` и прописываем путь, чтобы бот
+    AuthWatcher прислал inline-меню «📂 Подключиться по сессии».
     """
-    session_path = Path(cache_dir) / "bridge"
     logger.info(
-        "session watcher started (path=%s, poll=%.1fs)",
-        session_path, SESSION_WATCH_INTERVAL,
+        "session watcher started (cache=%s, poll=%.1fs)",
+        cache_dir, SESSION_WATCH_INTERVAL,
     )
     started_at = time.time()
     last_posted_ok = False
+    last_announced_path: Optional[str] = None
     while not stop_event.is_set():
         try:
-            if session_path.is_file():
-                # Свежий ли файл?
+            candidates = _find_session_files(cache_dir)
+            if candidates:
+                # Берём самый свежий (первый после сортировки).
+                session_path = candidates[0]
                 mtime = session_path.stat().st_mtime
+                current = shared_db.get_auth_state()
+                current_status = current.get("status") or "unknown"
+                current_sf = current.get("session_file_path")
+
+                # Если в БД путь не зафиксирован — прописываем и
+                # переводим в session_attached (даже если status уже
+                # auth_required), чтобы владелец увидел кнопку «📂 Подключиться».
+                if current_sf != str(session_path):
+                    if current_status in ("auth_required", "unknown", None):
+                        logger.info(
+                            "session watcher: detected %s, switching to session_attached",
+                            session_path,
+                        )
+                        shared_db.set_session_file_path(str(session_path))
+                        shared_db.set_auth_state(
+                            "session_attached", error=None, clear_error=True
+                        )
+                        shared_db.set_notify_message(
+                            f"📥 На сервере обнаружен session-файл: "
+                            f"<code>{session_path.name}</code>. "
+                            f"Нажмите «📂 Подключиться по сессии» в меню авторизации."
+                        )
+                        last_posted_ok = False
+                        last_announced_path = str(session_path)
+                        continue
+
                 if mtime < started_at - 5.0:
                     # Файл старый (например, лежал до старта supervisor'а).
                     # НЕ ставим ok автоматически — пусть решает владелец.
@@ -264,8 +332,6 @@ async def _watch_session_file(
                 else:
                     # Файл свежий — может ставить ok, но только если мост
                     # реально в процессе авторизации, а не ждёт команды.
-                    current = shared_db.get_auth_state()
-                    current_status = current.get("status") or "unknown"
                     if current_status in ("auth_required", "need_2fa", "rate_limited"):
                         # Владелец ещё не подтвердил / идёт 2FA / rate-limit.
                         # Watcher не должен вмешиваться.
@@ -328,15 +394,18 @@ async def run() -> None:
     # === Стартовая инициализация: режим «только по команде» ===
     initial = shared_db.get_auth_state()
     initial_status = initial.get("status") or "unknown"
-    initial_session_present = bool(initial.get("session_file_path")) or (
-        Path(cache_dir) / "bridge"
-    ).is_file()
+    initial_session_candidates = _find_session_files(cache_dir)
+    initial_session_present = bool(initial.get("session_file_path")) or bool(
+        initial_session_candidates
+    )
 
     if initial_status == "ok" and initial_session_present:
         # Тёплый запуск с валидной сессией. Всё равно требуем явного
         # подтверждения — выставляем auth_required, чтобы бот показал
         # inline-меню «Подключиться по сессии / SMS». Сессию на диске
         # НЕ трогаем.
+        if initial_session_candidates and not initial.get("session_file_path"):
+            shared_db.set_session_file_path(str(initial_session_candidates[0]))
         shared_db.set_auth_state("auth_required", error=None, clear_error=True)
         shared_db.set_notify_message(
             "🔁 Найдена сохранённая сессия MAX. Подтвердите подключение: "
@@ -349,10 +418,22 @@ async def run() -> None:
         # Холодный запуск или восстановление после rate-limit/ok-without-session.
         if initial_status != "auth_required":
             shared_db.set_auth_state("auth_required", error=None, clear_error=True)
-        shared_db.set_notify_message(
-            "🆕 MAX-мост запущен. Выберите способ авторизации: «🔐 SMS-авторизация» "
-            "или «📂 Подключиться по сессии» (если она уже загружена)."
-        )
+        # Если на диске есть session-файл с произвольным именем (владелец
+        # положил руками) — прописываем его в auth_state, чтобы бот увидел
+        # кнопку «📂 Подключиться по сессии».
+        if initial_session_candidates and not initial.get("session_file_path"):
+            shared_db.set_session_file_path(str(initial_session_candidates[0]))
+            shared_db.set_auth_state("session_attached", error=None, clear_error=True)
+            shared_db.set_notify_message(
+                f"📥 На сервере обнаружен session-файл: "
+                f"<code>{initial_session_candidates[0].name}</code>. "
+                f"Нажмите «📂 Подключиться по сессии» в меню авторизации."
+            )
+        else:
+            shared_db.set_notify_message(
+                "🆕 MAX-мост запущен. Выберите способ авторизации: «🔐 SMS-авторизация» "
+                "или «📂 Подключиться по сессии» (если она уже загружена)."
+            )
         logger.info(
             "cold start: status=%s → auth_required, waiting for owner", initial_status
         )
@@ -367,6 +448,8 @@ async def run() -> None:
         )
     elif initial_status == "session_attached":
         # Владелец загрузил сессию, но Client ещё не запускался.
+        if initial_session_candidates and not initial.get("session_file_path"):
+            shared_db.set_session_file_path(str(initial_session_candidates[0]))
         logger.info("session_attached on start: waiting for owner confirm")
         shared_db.set_notify_message(
             "📂 Сессия MAX загружена в кэш. Подтвердите подключение через бота."
@@ -403,8 +486,17 @@ async def run() -> None:
             # 1) Текущее состояние
             auth = shared_db.get_auth_state()
             status = auth.get("status") or "unknown"
-            session_path = Path(cache_dir) / "bridge"
-            has_session_file = session_path.is_file()
+            session_candidates = _find_session_files(cache_dir)
+            has_session_file = bool(session_candidates)
+            # Путь к «актуальному» файлу: сначала то, что в БД, иначе —
+            # самый свежий кандидат на диске.
+            session_path_db = auth.get("session_file_path")
+            if session_path_db:
+                session_path = Path(session_path_db)
+            elif session_candidates:
+                session_path = session_candidates[0]
+            else:
+                session_path = Path(cache_dir) / "bridge"
 
             # 2) Client жив и status=ok — мост работает, ничего не делаем
             if client_task is not None and not client_task.done() and status == "ok":
@@ -579,6 +671,37 @@ async def run() -> None:
                         "через бота (кнопка «📂 Загрузить сессию MAX»)."
                     )
                     continue
+                # PyMax ищет сессию строго в ``cache_dir/bridge``. Если
+                # выбранный файл — не ``bridge``/``bridge.db``, копируем
+                # его в ``bridge`` и подчищаем sidecar-файлы.
+                if session_path.name not in ("bridge", "bridge.db"):
+                    target = Path(cache_dir) / "bridge"
+                    try:
+                        for sidecar in (
+                            Path(cache_dir) / "bridge.db-shm",
+                            Path(cache_dir) / "bridge.db-wal",
+                        ):
+                            if sidecar.exists():
+                                sidecar.unlink()
+                        shutil.copy2(session_path, target)
+                        logger.info(
+                            "copied session %s → %s for attach",
+                            session_path, target,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to copy session %s → bridge: %s",
+                            session_path, exc,
+                        )
+                        shared_db.set_auth_state(
+                            "auth_required", error=None, clear_error=True
+                        )
+                        shared_db.set_notify_message(
+                            f"❌ Не удалось подготовить session-файл: {exc}. "
+                            "Попробуйте загрузить его через бота."
+                        )
+                        continue
+                shared_db.set_session_file_path(str(Path(cache_dir) / "bridge.db"))
                 shared_db.set_auth_state("session_attached", error=None, clear_error=True)
                 shared_db.set_notify_message("📂 Подключаюсь по сохранённой сессии…")
                 client = build_client(phone, cache_dir)
