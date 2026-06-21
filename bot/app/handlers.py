@@ -547,11 +547,31 @@ async def upload_session_file_handler(message: types.Message, state: FSMContext)
 
 
 async def reply_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Обработчик inline-кнопки «💬 Ответить».
+
+    В ``callback_data`` лежит только короткий ``event_id`` (из-за 64-байтного
+    лимита Telegram). Реальный ``max_chat_id`` достаём из БД через
+    ``api.get_event(event_id)``.
+    """
     if not callback.from_user or not _is_allowed(callback.from_user.id):
         return await callback.answer("⛔", show_alert=True)
     if not callback.data or ":" not in callback.data:
-        return await callback.answer()
-    _, chat_id = callback.data.split(":", 1)
+        return await callback.answer("⚠️", show_alert=True)
+    try:
+        _, raw_id = callback.data.split(":", 1)
+        event_id = int(raw_id)
+    except (ValueError, IndexError):
+        return await callback.answer("⚠️ битый callback", show_alert=True)
+    try:
+        ev = await api.get_event(event_id)
+    except Exception as exc:
+        logger.warning("reply_callback get_event(%s) failed: %s", event_id, exc)
+        return await callback.answer("⚠️ API", show_alert=True)
+    if not ev:
+        return await callback.answer("⚠️ событие не найдено", show_alert=True)
+    chat_id = ev.get("max_chat_id") or ""
+    if not chat_id:
+        return await callback.answer("⚠️ пустой chat_id", show_alert=True)
     await state.set_state(ReplyState.waiting_text)
     await state.update_data(target_chat_id=chat_id)
     await callback.answer()
@@ -564,8 +584,18 @@ async def reply_callback(callback: types.CallbackQuery, state: FSMContext) -> No
 
 async def showid_callback(callback: types.CallbackQuery) -> None:
     if not callback.data or ":" not in callback.data:
-        return await callback.answer()
-    _, chat_id = callback.data.split(":", 1)
+        return await callback.answer("⚠️", show_alert=True)
+    try:
+        _, raw_id = callback.data.split(":", 1)
+        event_id = int(raw_id)
+    except (ValueError, IndexError):
+        return await callback.answer("⚠️ битый callback", show_alert=True)
+    try:
+        ev = await api.get_event(event_id)
+    except Exception as exc:
+        logger.warning("showid_callback get_event(%s) failed: %s", event_id, exc)
+        return await callback.answer("⚠️ API", show_alert=True)
+    chat_id = (ev or {}).get("max_chat_id") or "?"
     await callback.answer(f"ID: {chat_id}", show_alert=True)
 
 
@@ -573,8 +603,22 @@ async def history_callback(callback: types.CallbackQuery) -> None:
     if not callback.from_user or not _is_allowed(callback.from_user.id):
         return await callback.answer("⛔", show_alert=True)
     if not callback.data or ":" not in callback.data:
-        return await callback.answer()
-    _, chat_id = callback.data.split(":", 1)
+        return await callback.answer("⚠️", show_alert=True)
+    try:
+        _, raw_id = callback.data.split(":", 1)
+        event_id = int(raw_id)
+    except (ValueError, IndexError):
+        return await callback.answer("⚠️ битый callback", show_alert=True)
+    try:
+        ev = await api.get_event(event_id)
+    except Exception as exc:
+        logger.warning("history_callback get_event(%s) failed: %s", event_id, exc)
+        return await callback.answer("⚠️ API", show_alert=True)
+    if not ev:
+        return await callback.answer("⚠️ событие не найдено", show_alert=True)
+    chat_id = ev.get("max_chat_id") or ""
+    if not chat_id:
+        return await callback.answer("⚠️ пустой chat_id", show_alert=True)
     await callback.answer()
     try:
         events = await api.list_events_for_chat(chat_id, limit=20)

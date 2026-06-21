@@ -26,6 +26,26 @@ class BotApi:
     async def list_events_for_chat(self, chat_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         return await self._client.list_events_for_chat(chat_id, limit=limit)
 
+    async def get_event(self, event_id: int) -> Optional[Dict[str, Any]]:
+        """Получить одно событие по id (нужно для callback'ов reply/showid/history,
+        которые передают только короткий ``event_id`` в callback_data).
+        Возвращает ``None``, если событие не найдено.
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=10.0
+        ) as c:
+            try:
+                r = await c.get(
+                    f"/events/{event_id}",
+                    headers=self._client._headers(),
+                )
+            except httpx.HTTPError:
+                return None
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json() if r.content else None
+
     async def mark_delivered(self, event_id: int) -> None:
         await self._client.mark_delivered(event_id)
 

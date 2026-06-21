@@ -232,6 +232,22 @@ def list_events(
     return [_event_to_out(r) for r in rows]
 
 
+@app.get("/events/{event_id}", response_model=EventOut, dependencies=[Depends(verify_api_key)])
+def get_event(event_id: int) -> EventOut:
+    """Получить одно событие по id (нужно бота-колбэкам reply/showid/history,
+    которые получают только короткий ``event_id`` в callback_data из-за
+    64-байтного лимита Telegram Bot API на ``callback_data``).
+    """
+    from fastapi import HTTPException as _HTTPException
+
+    with db.session_scope() as s:
+        row = s.get(db.Event, event_id)
+        if not row:
+            raise _HTTPException(status_code=404, detail="event not found")
+        s.expunge(row)
+        return _event_to_out(row)
+
+
 @app.get("/events/by-chat/{chat_id}", response_model=List[EventOut], dependencies=[Depends(verify_api_key)])
 def events_by_chat(chat_id: str, limit: int = Query(default=20, ge=1, le=200)) -> List[EventOut]:
     rows = db.list_events_for_chat(chat_id, limit=limit)

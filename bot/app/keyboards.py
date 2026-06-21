@@ -35,20 +35,34 @@ def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
     )
 
 
-def event_inline_keyboard(event_id: int, max_chat_id: str) -> types.InlineKeyboardMarkup:
+def event_inline_keyboard(event_id: int, max_chat_id: str = "") -> types.InlineKeyboardMarkup:
+    """Inline-клавиатура под сообщением из MAX.
+
+    В ``callback_data`` кладём **только короткий** ``event_id`` (число), а не
+    ``max_chat_id``: PyMax возвращает длинные base64-подобные идентификаторы,
+    которые вместе с префиксом легко превышают 64-байтный лимит Telegram Bot
+    API на ``callback_data`` — тогда кнопка либо ломается, либо приходит с
+    обрезанными данными и хэндлеры молча выходят (пользователь видит «часики»
+    без реакции). Сам ``max_chat_id`` хэндлер достаёт из БД через
+    ``api.get_event(event_id)``.
+
+    Параметр ``max_chat_id`` оставлен в сигнатуре для совместимости с
+    другими местами вызова и игнорируется.
+    """
+    eid = int(event_id) if event_id else 0
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="💬 Ответить", callback_data=f"reply:{max_chat_id}"
+                    text="💬 Ответить", callback_data=f"reply:{eid}"
                 ),
                 types.InlineKeyboardButton(
-                    text="📋 ID чата", callback_data=f"showid:{max_chat_id}"
+                    text="📋 ID чата", callback_data=f"showid:{eid}"
                 ),
             ],
             [
                 types.InlineKeyboardButton(
-                    text="🔄 История", callback_data=f"history:{max_chat_id}"
+                    text="🔄 История", callback_data=f"history:{eid}"
                 ),
             ],
         ]
