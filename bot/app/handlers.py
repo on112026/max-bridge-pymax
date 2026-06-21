@@ -1181,7 +1181,6 @@ def register_handlers(dp: Dispatcher) -> None:
         auth_action_callback, AuthActionCallback.filter()
     )
 
-    # ВАЖНО: должен быть ПОСЛЕДНИМ — срабатывает, если ни один фильтр выше
-    # не подошёл. Помогает отличить «dispatcher не получил update» от
-    # «фильтр не совпал».
-    dp.callback_query.register(callback_unknown)
+    # callback_unknown УДАЛЁН: пустой фильтр перехватывал все callback'и
+    # до того, как фильтрующие хэндлеры успевали сработать. Логи в начале
+    # reply/showid/history всё равно покажут, дошёл ли до них dispatcher.
