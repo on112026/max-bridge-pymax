@@ -41,6 +41,7 @@ from app.keyboards import (
 )
 from app.sender import forward_event
 from app.states import ReplyState, ReauthSmsState, UploadSessionState
+from app.keyboards import session_use_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,74 @@ async def history_callback(callback: types.CallbackQuery) -> None:
             await forward_event(callback.message.bot, callback.message.chat.id, ev)
         except Exception as exc:
             await callback.message.answer(f"⚠️ Не удалось переслать {ev.get('id')}: {exc}")
+
+
+# ---------- /sessions — управление session-файлами ----------
+
+
+async def sessions_command(message: types.Message) -> None:
+    """Команда /sessions — показывает список доступных session-файлов"""
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+
+    await message.answer("🔄 Запрашиваю список сессий...")
+
+    try:
+        data = await api.get_session_list()
+
+        if not data or not data.get("sessions"):
+            await message.answer("📭 В кэше нет сохранённых session-файлов.")
+            return
+
+        sessions = data["sessions"]
+        current = data.get("current")
+
+        text = "📂 **Доступные session-файлы:**\n\n"
+        for s in sessions[:15]:  # лимит для читаемости
+            size_kb = s["size"] // 1024
+            mod_time = ""
+            if s.get("modified"):
+                from datetime import datetime
+                dt = datetime.fromtimestamp(s["modified"])
+                mod_time = f" • {dt.strftime('%d.%m %H:%M')}"
+
+            current_mark = " ✅ **ТЕКУЩАЯ**" if current and s["path"] == current else ""
+            text += f"• `{s['name']}` ({size_kb} КБ){mod_time}{current_mark}\n"
+
+        text += f"\n**Всего:** {len(sessions)} файл(ов)"
+
+        # Кнопки для быстрого выбора
+        from app.keyboards import session_use_keyboard
+        kb = session_use_keyboard([s["name"] for s in sessions[:8]])
+
+        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+    except Exception as exc:
+        logger.error("sessions_command failed: %s", exc)
+        await message.answer(f"❌ Не удалось получить список сессий: {exc}")
+
+
+async def session_use_callback(callback: types.CallbackQuery) -> None:
+    """Обработчик inline-кнопки «Использовать эту сессию»"""
+    if not callback.from_user or not _is_allowed(callback.from_user.id):
+        return await callback.answer("⛔", show_alert=True)
+
+    if not callback.data or ":" not in callback.data:
+        return await callback.answer()
+
+    _, session_name = callback.data.split(":", 1)
+
+    await callback.answer(f"Используем {session_name}...")
+
+    try:
+        await api.use_session(session_name)
+        await callback.message.answer(
+            f"✅ Сессия `{session_name}` скопирована в `bridge.db`.\n"
+            "Теперь нажмите «📂 Подключиться по сессии» в меню авторизации."
+        )
+    except Exception as exc:
+        logger.warning("session_use failed for %s: %s", session_name, exc)
+        await callback.message.answer(f"❌ Не удалось использовать сессию: {exc}")
 
 
 # ---------- Inline: auth:sms / auth:session / auth:upload / auth:cancel ----------

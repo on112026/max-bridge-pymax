@@ -7,13 +7,13 @@ from aiogram.filters.callback_data import CallbackData
 
 
 class AuthActionCallback(CallbackData, prefix="auth"):
-    """Inline-кнопки выбора способа авторизации MAX.
-
-    Префикс ``auth:`` чтобы не пересекаться с ``reply:`` / ``showid:`` /
-    ``history:`` в общем пространстве callback_data.
-    """
-
+    """Inline-кнопки выбора способа авторизации MAX."""
     action: str  # "sms" | "session" | "cancel" | "upload"
+
+
+class SessionUseCallback(CallbackData, prefix="session_use"):
+    """Callback для выбора конкретной сессии"""
+    session_name: str
 
 
 def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
@@ -53,17 +53,10 @@ def event_inline_keyboard(event_id: int, max_chat_id: str) -> types.InlineKeyboa
 
 
 def auth_choice_keyboard(
-    show_upload: bool = True,
-    show_session_connect: bool = True,
+        show_upload: bool = True,
+        show_session_connect: bool = True,
 ) -> types.InlineKeyboardMarkup:
-    """Inline-меню, которое AuthWatcher шлёт владельцу при status=auth_required.
-
-    Кнопки:
-      * 🔐 SMS-авторизация      → ``auth:sms``     (старт нового Client + SMS)
-      * 📂 Подключиться по сессии → ``auth:session`` (только если есть файл)
-      * 📎 Загрузить файл сессии  → ``auth:upload``  (только если файла ещё нет)
-      * ⛔ Отмена                 → ``auth:cancel``
-    """
+    """Inline-меню выбора способа авторизации."""
     rows: list[list[types.InlineKeyboardButton]] = []
     rows.append(
         [
@@ -99,4 +92,27 @@ def auth_choice_keyboard(
             )
         ]
     )
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def session_use_keyboard(session_names: list[str]) -> types.InlineKeyboardMarkup:
+    """Клавиатура со списком доступных session-файлов для быстрого выбора."""
+    rows: list[list[types.InlineKeyboardButton]] = []
+
+    for name in session_names[:8]:  # не больше 8 кнопок за раз
+        rows.append([
+            types.InlineKeyboardButton(
+                text=f"📄 {name}",
+                callback_data=SessionUseCallback(session_name=name).pack(),
+            )
+        ])
+
+    # Кнопка обновления списка
+    rows.append([
+        types.InlineKeyboardButton(
+            text="🔄 Обновить список",
+            callback_data="sessions_refresh"
+        )
+    ])
+
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
