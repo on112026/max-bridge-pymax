@@ -175,6 +175,10 @@ class BotApi:
             r.raise_for_status()
             return r.json() if r.content else {"sessions": []}
 
+    # Алиас для обратной совместимости со старым кодом ``handlers.py``
+    # (вызывающим ``api.get_session_list()``). Оба имени работают.
+    get_session_list = list_sessions
+
     async def use_session(self, session_name: str) -> Dict[str, Any]:
         """Выбрать session-файл для использования (скопировать в bridge.db)."""
         async with httpx.AsyncClient(

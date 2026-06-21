@@ -564,6 +564,15 @@ async def reply_callback(callback: types.CallbackQuery, state: FSMContext) -> No
         return await callback.answer("⚠️ битый callback", show_alert=True)
     try:
         ev = await api.get_event(event_id)
+    except AttributeError:
+        # Запущен старый код api_client.py без метода get_event — фолбэк
+        # через list_events_for_chat. Callback_data содержит event_id,
+        # но в старом коде ожидался chat_id, поэтому парсим максимально
+        # терпимо.
+        logger.warning("reply_callback: api.get_event missing, fallback disabled")
+        return await callback.answer(
+            "⚠️ Бот работает со старым кодом — перезапустите контейнер", show_alert=True,
+        )
     except Exception as exc:
         logger.warning("reply_callback get_event(%s) failed: %s", event_id, exc)
         return await callback.answer("⚠️ API", show_alert=True)
