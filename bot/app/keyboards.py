@@ -11,6 +11,19 @@ class AuthActionCallback(CallbackData, prefix="auth"):
     action: str  # "sms" | "session" | "cancel" | "upload"
 
 
+class EventActionCallback(CallbackData, prefix="event"):
+    """Inline-кнопки под сообщением из MAX.
+
+    В aiogram 3.15 есть баг, когда фильтр ``F.callback_data.startswith(...)``
+    не работает корректно, если в dispatcher одновременно есть хэндлеры
+    с ``CallbackData.filter()``. Поэтому для inline-кнопок событий
+    используем единый ``CallbackData``-класс с диспатчем по ``action``.
+    """
+
+    action: str  # "reply" | "showid" | "history"
+    event_id: int
+
+
 class SessionUseCallback(CallbackData, prefix="session_use"):
     """Callback для выбора конкретной сессии"""
     session_name: str
@@ -38,31 +51,31 @@ def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
 def event_inline_keyboard(event_id: int, max_chat_id: str = "") -> types.InlineKeyboardMarkup:
     """Inline-клавиатура под сообщением из MAX.
 
-    В ``callback_data`` кладём **только короткий** ``event_id`` (число), а не
-    ``max_chat_id``: PyMax возвращает длинные base64-подобные идентификаторы,
-    которые вместе с префиксом легко превышают 64-байтный лимит Telegram Bot
-    API на ``callback_data`` — тогда кнопка либо ломается, либо приходит с
-    обрезанными данными и хэндлеры молча выходят (пользователь видит «часики»
-    без реакции). Сам ``max_chat_id`` хэндлер достаёт из БД через
-    ``api.get_event(event_id)``.
+    Использует ``EventActionCallback`` (CallbackData-класс) — это критично
+    в aiogram 3.15, где смешивание ``F.callback_data.startswith(...)`` с
+    ``CallbackData.filter()`` ломает фильтрацию.
 
     Параметр ``max_chat_id`` оставлен в сигнатуре для совместимости с
-    другими местами вызова и игнорируется.
+    другими местами вызова и игнорируется (хэндлер достаёт ``max_chat_id``
+    из БД через ``api.get_event(event_id)``).
     """
     eid = int(event_id) if event_id else 0
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="💬 Ответить", callback_data=f"reply:{eid}"
+                    text="💬 Ответить",
+                    callback_data=EventActionCallback(action="reply", event_id=eid).pack(),
                 ),
                 types.InlineKeyboardButton(
-                    text="📋 ID чата", callback_data=f"showid:{eid}"
+                    text="📋 ID чата",
+                    callback_data=EventActionCallback(action="showid", event_id=eid).pack(),
                 ),
             ],
             [
                 types.InlineKeyboardButton(
-                    text="🔄 История", callback_data=f"history:{eid}"
+                    text="🔄 История",
+                    callback_data=EventActionCallback(action="history", event_id=eid).pack(),
                 ),
             ],
         ]
