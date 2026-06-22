@@ -526,28 +526,18 @@ async def _watch_session_file(
                         last_announced_path = str(session_path)
                         continue
 
-                if mtime < started_at - 5.0:
-                    # Файл старый (например, лежал до старта supervisor'а).
-                    # НЕ ставим ok автоматически — пусть решает владелец.
-                    last_posted_ok = False
-                else:
-                    # Файл свежий — может ставить ok, но только если мост
-                    # реально в процессе авторизации, а не ждёт команды.
-                    if current_status in ("auth_required", "need_2fa", "rate_limited"):
-                        # Владелец ещё не подтвердил / идёт 2FA / rate-limit.
-                        # Watcher не должен вмешиваться.
-                        last_posted_ok = False
-                    else:
-                        if not last_posted_ok:
-                            logger.info(
-                                "session file detected (mtime=%.0f, started_at=%.0f, status=%s), "
-                                "marking auth=ok",
-                                mtime, started_at, current_status,
-                            )
-                            shared_db.set_auth_state(
-                                "ok", last_login=True, clear_error=True,
-                            )
-                            last_posted_ok = True
+                # ВАЖНО: watcher НЕ должен автоматически выставлять ``status=ok`` —
+                # это прерогатива только ``_on_start`` (см. bridge.py), который
+                # срабатывает при реальном успешном старте Client'а. Иначе
+                # supervisor при следующей итерации видит ``status=ok`` и считает,
+                # что Client жив — пропускает ``consume_pending_action``, и мост
+                # никогда не поднимается (классическая ловушка "fake ok").
+
+                # Старый код с ``mtime < started_at - 5.0`` / ``set_auth_state("ok")``
+                # удалён — он и был причиной регрессии, когда supervisor не
+                # поднимал Client после рестарта, но в БД уже стоял ``status=ok``.
+                _ = (mtime, started_at, current_status)  # keep references for linters
+                last_posted_ok = False
         except Exception as exc:
             logger.warning("session watcher error: %s", exc)
         try:
@@ -665,6 +655,36 @@ async def run() -> None:
             "📂 Сессия MAX загружена в кэш. Подтвердите подключение через бота."
         )
     # auth_required — оставляем, владелец уже в процессе выбора.
+
+    # === Защита от "fake ok" ===
+    # В этом месте процесса Client ещё НЕ создан (``client_task is None``).
+    # Если в БД остался ``status=ok`` от прошлой сессии, supervisor::run()
+    # будет бесконечно пропускать обработку ``pending_action`` в блоке
+    # «5) Client'а нет, status=ok — ждём команду». Чтобы это исправить,
+    # принудительно сбрасываем ``status=ok`` → ``auth_required`` на старте
+    # (Client ещё не поднят — мы только начинаем).
+    #
+    # ВАЖНО: ``pending_action`` НЕ трогаем — он будет обработан в цикле ниже.
+    # Если пользователь только что нажал «📂 Подключиться по сессии»,
+    # и supervisor ещё не успел обработать, его команда НЕ должна потеряться.
+    current_after_init = shared_db.get_auth_state()
+    if current_after_init.get("status") == "ok":
+        logger.warning(
+            "stale status=ok detected at startup (Client not yet running); "
+            "forcing auth_required to allow processing pending_action"
+        )
+        shared_db.set_auth_state("auth_required", error=None, clear_error=True)
+        shared_db.set_notify_message(
+            "🆕 MAX-мост перезапущен. Подтвердите подключение: "
+            "«📂 Подключиться по сессии» или «🔐 SMS-авторизация»."
+        )
+        # НЕ очищаем ``pending_action`` — пользователь мог только что нажать
+        # кнопку, и его команда должна быть обработана.
+        if current_after_init.get("pending_action"):
+            logger.info(
+                "startup: pending_action=%r preserved, will be processed below",
+                current_after_init.get("pending_action"),
+            )
 
     # Запускаем drain system_state — без него мост мёртв (см. _drain_2fa_codes_loop).
     drain_task = asyncio.create_task(_drain_2fa_codes_loop(stop_event), name="2fa-drain")
