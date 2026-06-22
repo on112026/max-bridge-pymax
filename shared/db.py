@@ -132,6 +132,39 @@ class SystemState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class DeliveredMessage(Base):
+    """Сообщения из MAX, доставленные ботом в Telegram.
+
+    Когда ``EventPoller`` отправляет сообщение в TG (``forward_event``),
+    мы записываем сюда ``(max_chat_id, max_message_id, delivered_at)``.
+    Это «базовая линия» для пометки прочитанным: MAX-процесс помечает
+    прочитанными только те сообщения, которые доставлены в TG и пользователь
+    как-то отреагировал (см. ``ChatReadState``).
+    """
+
+    __tablename__ = "delivered_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    max_chat_id = Column(String, index=True, nullable=False)
+    max_message_id = Column(String, index=True, nullable=False)
+    delivered_at = Column(DateTime, default=datetime.utcnow, index=True)
+    read_at = Column(DateTime, nullable=True, index=True)
+
+
+class ChatReadState(Base):
+    """Время последнего «прочтения» чата пользователем в TG-боте.
+
+    Любое действие пользователя (``REPLY``, ``SHOWID``, ``HISTORY``, ввод
+    текста через ``/reply`` и т.п.) обновляет ``last_read_at = now()``.
+    MAX-процесс периодически берёт все сообщения чата с
+    ``delivered_at <= last_read_at`` и ``read_at IS NULL`` и помечает
+    их прочитанными через ``client.read_message``.
+    """
+
+    __tablename__ = "chat_read_state"
+    max_chat_id = Column(String, primary_key=True)
+    last_read_at = Column(DateTime, default=datetime.utcnow)
+
+
 # Маппинг SQLAlchemy-типов на компактные имена SQLite-типов, которые мы
 # используем в ``ALTER TABLE ... ADD COLUMN``. Для SQLite формат хранения
 # не критичен (``NUMERIC`` / ``TEXT`` / ``INTEGER``), но значения должны
@@ -632,3 +665,95 @@ def clear_2fa_request() -> None:
         row.pending_2fa_request_id = None
         row.pending_2fa_kind = None
         row.updated_at = datetime.utcnow()
+
+
+# --- Доставка в TG + пометка прочитанным ---
+
+
+def record_delivered(max_chat_id: str, max_message_id: str) -> None:
+    """Записать факт доставки сообщения из MAX в TG-бот.
+
+    Используется из API при вызове ``POST /events/{id}/delivered``.
+    Идемпотентно: если запись уже есть, обновляет ``delivered_at``.
+    """
+    from sqlalchemy import update
+
+    with session_scope() as s:
+        existing = (
+            s.query(DeliveredMessage)
+            .filter(
+                DeliveredMessage.max_chat_id == str(max_chat_id),
+                DeliveredMessage.max_message_id == str(max_message_id),
+            )
+            .first()
+        )
+        if existing:
+            existing.delivered_at = datetime.utcnow()
+            s.flush()
+        else:
+            s.add(DeliveredMessage(
+                max_chat_id=str(max_chat_id),
+                max_message_id=str(max_message_id),
+                delivered_at=datetime.utcnow(),
+            ))
+
+
+def update_chat_read_state(max_chat_id: str, read_at: Optional[datetime] = None) -> None:
+    """Обновить ``last_read_at`` для чата (вызывается при любом действии пользователя).
+
+    Идемпотентно: только увеличивает ``last_read_at`` (никогда не уменьшает).
+    """
+    when = read_at or datetime.utcnow()
+    with session_scope() as s:
+        existing = (
+            s.query(ChatReadState)
+            .filter(ChatReadState.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if existing:
+            if when > existing.last_read_at:
+                existing.last_read_at = when
+        else:
+            s.add(ChatReadState(
+                max_chat_id=str(max_chat_id),
+                last_read_at=when,
+            ))
+
+
+def get_pending_read_receipts(limit: int = 100) -> List[DeliveredMessage]:
+    """MAX-процесс забирает все доставленные, но ещё не помеченные
+    прочитанными сообщения, у которых ``delivered_at <= min(chat.last_read_at)``.
+    Возвращает ``DeliveredMessage`` с непустым ``read_at = None``.
+    """
+    with session_scope() as s:
+        rows = (
+            s.execute(
+                select(DeliveredMessage)
+                .join(
+                    ChatReadState,
+                    DeliveredMessage.max_chat_id == ChatReadState.max_chat_id,
+                    isouter=False,
+                )
+                .where(
+                    DeliveredMessage.read_at.is_(None),
+                    DeliveredMessage.delivered_at <= ChatReadState.last_read_at,
+                )
+                .order_by(DeliveredMessage.delivered_at.asc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        s.expunge_all()
+        return list(rows)
+
+
+def mark_delivered_as_read(delivered_id: int) -> None:
+    """MAX-процесс вызывает после успешного ``client.read_message``.
+    Проставляет ``read_at = now()`` — повторно брать эту запись не будем.
+    """
+    with session_scope() as s:
+        row = s.get(DeliveredMessage, delivered_id)
+        if not row:
+            return
+        row.read_at = datetime.utcnow()

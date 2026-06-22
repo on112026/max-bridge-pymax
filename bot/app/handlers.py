@@ -175,6 +175,11 @@ async def history_command(message: types.Message) -> None:
     except Exception as exc:
         await message.answer(f"⚠️ Ошибка: {exc}")
         return
+    # Помечаем чат как прочитанный (пользователь явно запросил историю).
+    try:
+        await api.mark_chat_read_up_to(chat_id=chat_id)
+    except Exception as exc:
+        logger.warning("mark_chat_read_up_to failed: %s", exc)
     if not events:
         await message.answer("История пуста.")
         return
@@ -415,6 +420,11 @@ async def reply_text(message: types.Message, state: FSMContext) -> None:
         )
     except Exception as exc:
         await message.answer(f"⚠️ Ошибка постановки в очередь: {exc}")
+    # Помечаем чат как прочитанный (пользователь явно ответил).
+    try:
+        await api.mark_chat_read_up_to(chat_id=target)
+    except Exception as exc:
+        logger.warning("mark_chat_read_up_to failed: %s", exc)
     await state.clear()
 
 
@@ -472,6 +482,11 @@ async def reply_media(message: types.Message, state: FSMContext) -> None:
         )
     except Exception as exc:
         await message.answer(f"⚠️ Ошибка: {exc}")
+    # Помечаем чат как прочитанный.
+    try:
+        await api.mark_chat_read_up_to(chat_id=target)
+    except Exception as exc:
+        logger.warning("mark_chat_read_up_to failed: %s", exc)
     await state.clear()
 
 
@@ -637,6 +652,11 @@ async def event_action_callback(
             "(или пришлите фото/видео/документ).\n/cancel — выйти.",
             parse_mode="HTML",
         )
+        # Помечаем чат как прочитанный в TG → MAX-процесс вызовет client.read_message.
+        try:
+            await api.mark_chat_read_up_to(chat_id=chat_id)
+        except Exception as exc:
+            logger.warning("mark_chat_read_up_to failed: %s", exc)
         logger.info(
             "event_action_callback: REPLY done, FSM set for chat_id=%s", chat_id,
         )
@@ -644,6 +664,11 @@ async def event_action_callback(
 
     if action == "showid":
         await callback.answer(f"ID: {chat_id}", show_alert=True)
+        # Помечаем чат как прочитанный.
+        try:
+            await api.mark_chat_read_up_to(chat_id=chat_id)
+        except Exception as exc:
+            logger.warning("mark_chat_read_up_to failed: %s", exc)
         logger.info(
             "event_action_callback: SHOWID done, chat_id=%s", chat_id,
         )
@@ -651,6 +676,11 @@ async def event_action_callback(
 
     if action == "history":
         await callback.answer()
+        # Помечаем чат как прочитанный.
+        try:
+            await api.mark_chat_read_up_to(chat_id=chat_id)
+        except Exception as exc:
+            logger.warning("mark_chat_read_up_to failed: %s", exc)
         logger.info(
             "event_action_callback: HISTORY loading for chat_id=%s", chat_id,
         )

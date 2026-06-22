@@ -192,5 +192,41 @@ class BotApi:
             r.raise_for_status()
             return r.json() if r.content else {"ok": True}
 
+    async def mark_chat_read_up_to(self, chat_id: str) -> None:
+        """Пометить все сообщения чата до текущего момента как прочитанные.
+
+        Бот вызывает при любом действии пользователя (REPLY, SHOWID,
+        ввод текста через /reply). MAX-процесс заберёт эти данные
+        и вызовет client.read_message для каждого сообщения.
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=10.0
+        ) as c:
+            r = await c.post(
+                f"/chats/{chat_id}/read-up-to",
+                headers=self._client._headers(),
+            )
+            # Не падаем, если ошибка — пометка прочтения не критична.
+            if r.status_code >= 400:
+                logger.warning(
+                    "mark_chat_read_up_to %s failed: %s %s",
+                    chat_id, r.status_code, r.text[:200],
+                )
+
+    async def get_pending_read_receipts(self) -> List[Dict[str, Any]]:
+        """MAX-процесс забирает список доставленных сообщений, которые
+        пользователь прочитал в TG. Не используется ботом, но пригодится
+        для тестов.
+        """
+        async with httpx.AsyncClient(
+            base_url=self._client.base_url, timeout=10.0
+        ) as c:
+            r = await c.get(
+                "/chats/pending-reads",
+                headers=self._client._headers(),
+            )
+            r.raise_for_status()
+            return r.json() if r.content else []
+
 
 api = BotApi()

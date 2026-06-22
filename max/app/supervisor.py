@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from pymax import Client
 from pymax.config import ExtraConfig
 from pymax.auth.sms import SmsAuthFlow
@@ -255,6 +256,155 @@ _ALREADY_NOTIFIED: set[int] = set()
 SESSION_WATCH_INTERVAL = 5.0
 
 
+# Интервал опроса API для пометки прочитанных сообщений в MAX.
+READ_RECEIPTS_INTERVAL = 3.0
+
+
+async def _claim_pending_reads(stop_event: asyncio.Event) -> list[dict]:
+    """Забирает из API список доставленных сообщений, которые пользователь
+    уже прочитал в TG (т.е. ``delivered_at <= chat.last_read_at``).
+
+    Возвращает список ``[{"id", "max_chat_id", "max_message_id", "delivered_at"}, ...]``.
+    При ошибке возвращает ``[]`` (не падаем).
+    """
+    import os as _os
+
+    api_base = _os.getenv("API_BASE_URL", "http://localhost:8000")
+    api_key = _os.getenv("BRIDGE_API_KEY", "")
+    try:
+        async with httpx.AsyncClient(
+            base_url=api_base,
+            headers={"X-Api-Key": api_key},
+            timeout=15.0,
+        ) as c:
+            r = await c.get("/chats/pending-reads")
+            r.raise_for_status()
+            data = r.json() if r.content else []
+            return list(data or [])
+    except Exception as exc:
+        logger.warning("claim_pending_reads failed: %s", exc)
+        return []
+
+
+async def _mark_message_read(delivered_id: int, max_chat_id: str, max_message_id: str) -> None:
+    """После успешного ``client.read_message`` помечает запись как прочитанную."""
+    import os as _os
+
+    api_base = _os.getenv("API_BASE_URL", "http://localhost:8000")
+    api_key = _os.getenv("BRIDGE_API_KEY", "")
+    try:
+        async with httpx.AsyncClient(
+            base_url=api_base,
+            headers={"X-Api-Key": api_key},
+            timeout=10.0,
+        ) as c:
+            r = await c.post(
+                f"/chats/{max_chat_id}/messages/{max_message_id}/read",
+                params={"delivered_id": str(delivered_id)},
+            )
+            if r.status_code >= 400:
+                logger.warning(
+                    "mark_message_read chat=%s msg=%s failed: %s %s",
+                    max_chat_id, max_message_id, r.status_code, r.text[:200],
+                )
+    except Exception as exc:
+        logger.warning(
+            "mark_message_read chat=%s msg=%s exception: %s",
+            max_chat_id, max_message_id, exc,
+        )
+
+
+async def _read_receipts_loop(
+    stop_event: asyncio.Event,
+    client_getter,
+) -> None:
+    """Периодически опрашивает API, вызывает ``client.read_message`` и помечает
+    успех в API.
+
+    ``client_getter`` — callable, возвращающий текущий ``Client`` (или ``None``,
+    если Client ещё не поднят). Это позволяет не пересоздавать Client при
+    рестарте: supervisor читает ``client`` из своей переменной через замыкание.
+    """
+    logger.info(
+        "read_receipts_loop started (poll=%.1fs)", READ_RECEIPTS_INTERVAL,
+    )
+    while not stop_event.is_set():
+        try:
+            client = client_getter()
+            if client is None:
+                # Client ещё не поднят (auth_required / session_attached).
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=READ_RECEIPTS_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                continue
+
+            receipts = await _claim_pending_reads(stop_event)
+            if not receipts:
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=READ_RECEIPTS_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                continue
+
+            logger.info(
+                "read_receipts_loop: %d pending receipts to mark", len(receipts),
+            )
+            for r in receipts:
+                if stop_event.is_set():
+                    break
+                chat_id_str = (r.get("max_chat_id") or "").strip()
+                msg_id_str = (r.get("max_message_id") or "").strip()
+                delivered_id = int(r.get("id") or 0)
+                if not chat_id_str or not msg_id_str:
+                    logger.warning(
+                        "read_receipts_loop: skip receipt with empty chat_id/msg_id: %r",
+                        r,
+                    )
+                    continue
+                try:
+                    chat_id_int = int(chat_id_str)
+                except ValueError:
+                    logger.warning(
+                        "read_receipts_loop: cannot convert chat_id=%r to int",
+                        chat_id_str,
+                    )
+                    continue
+                try:
+                    # PyMax: client.read_message(message_id, chat_id) -> ReadState
+                    await client.read_message(
+                        message_id=msg_id_str, chat_id=chat_id_int,
+                    )
+                    logger.info(
+                        "read_message ok: chat=%s msg=%s",
+                        chat_id_str, msg_id_str,
+                    )
+                    await _mark_message_read(
+                        delivered_id=delivered_id,
+                        max_chat_id=chat_id_str,
+                        max_message_id=msg_id_str,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "read_message FAILED chat=%s msg=%s: %s",
+                        chat_id_str, msg_id_str, exc,
+                    )
+                    # Не помечаем как прочитанное — попробуем в следующем тике.
+        except Exception as exc:
+            logger.warning("read_receipts_loop tick error: %s", exc)
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=READ_RECEIPTS_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _watch_session_file(
     stop_event: asyncio.Event,
     cache_dir: str,
@@ -388,8 +538,17 @@ async def run() -> None:
     sender_task: Optional[asyncio.Task] = None
     drain_task: Optional[asyncio.Task] = None
     session_task: Optional[asyncio.Task] = None
+    read_receipts_task: Optional[asyncio.Task] = None
     rate_limit_until: float = 0.0
     last_sms_request_at: float = 0.0
+
+    def _client_getter() -> Optional[Client]:
+        """Возвращает текущий Client для ``_read_receipts_loop``.
+
+        Замыкание над ``client`` позволяет loop'у читать актуальное
+        значение переменной без явной передачи параметров.
+        """
+        return client
 
     # === Стартовая инициализация: режим «только по команде» ===
     initial = shared_db.get_auth_state()
@@ -461,6 +620,12 @@ async def run() -> None:
     # Следим за session.db на диске — fallback для _on_start (см. _watch_session_file).
     session_task = asyncio.create_task(
         _watch_session_file(stop_event, cache_dir, phone), name="session-watcher",
+    )
+    # Помечаем сообщения из MAX как прочитанные, когда пользователь
+    # проявляет активность в TG-боте (см. _read_receipts_loop).
+    read_receipts_task = asyncio.create_task(
+        _read_receipts_loop(stop_event, _client_getter),
+        name="read-receipts",
     )
 
     try:
@@ -748,6 +913,13 @@ async def run() -> None:
             session_task.cancel()
             try:
                 await session_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Останавливаем read_receipts_loop.
+        if read_receipts_task is not None and not read_receipts_task.done():
+            read_receipts_task.cancel()
+            try:
+                await read_receipts_task
             except (asyncio.CancelledError, Exception):
                 pass
         if client is not None:

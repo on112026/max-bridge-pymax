@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "shared"))
 sys.path.insert(0, str(ROOT / "api"))
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -257,7 +258,102 @@ def events_by_chat(chat_id: str, limit: int = Query(default=20, ge=1, le=200)) -
 @app.post("/events/{event_id}/delivered", response_model=OkOut, dependencies=[Depends(verify_api_key)])
 def mark_event_delivered(event_id: int) -> OkOut:
     db.mark_event_delivered(event_id)
+    # Параллельно записываем в ``delivered_messages`` — это источник истины
+    # для пометки прочитанным в MAX. Делаем ``best effort``: если событие
+    # не найдено в ``events``, пропускаем.
+    try:
+        with db.session_scope() as s:
+            row = s.get(db.Event, event_id)
+            if row is not None:
+                db.record_delivered(row.max_chat_id, row.max_message_id)
+    except Exception as exc:
+        logger.warning("record_delivered for event %s failed: %s", event_id, exc)
     return OkOut(ok=True)
+
+
+# ---------- Read receipts: «прочитано» в TG → MAX ----------
+
+
+class PendingReadReceipt(BaseModel):
+    id: int
+    max_chat_id: str
+    max_message_id: str
+    delivered_at: str
+
+
+class ReadReceiptOk(BaseModel):
+    ok: bool = True
+    marked: int = 0
+
+
+@app.post(
+    "/chats/{chat_id}/read-up-to",
+    response_model=OkOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def mark_chat_read_up_to(chat_id: str) -> OkOut:
+    """Бот вызывает при любом действии пользователя (REPLY, SHOWID, ввод текста).
+
+    Это значит «все сообщения этого чата до этого момента прочитаны».
+    MAX-процесс заберёт доставленные сообщения с ``delivered_at <= now``
+    через ``GET /chats/pending-reads`` и пометит их в MAX через ``client.read_message``.
+    """
+    db.update_chat_read_state(chat_id)
+    return OkOut(ok=True)
+
+
+@app.get(
+    "/chats/pending-reads",
+    response_model=List[PendingReadReceipt],
+    dependencies=[Depends(verify_api_key)],
+)
+def get_pending_reads(limit: int = Query(default=50, ge=1, le=500)) -> List[PendingReadReceipt]:
+    """MAX-процесс забирает список доставленных сообщений, которые уже можно
+    пометить прочитанными (``delivered_at <= chat.last_read_at``, ``read_at IS NULL``).
+    """
+    rows = db.get_pending_read_receipts(limit=limit)
+    return [
+        PendingReadReceipt(
+            id=r.id,
+            max_chat_id=r.max_chat_id,
+            max_message_id=r.max_message_id,
+            delivered_at=r.delivered_at.isoformat() if r.delivered_at else "",
+        )
+        for r in rows
+    ]
+
+
+@app.post(
+    "/chats/{chat_id}/messages/{message_id}/read",
+    response_model=ReadReceiptOk,
+    dependencies=[Depends(verify_api_key)],
+)
+def mark_message_read(chat_id: str, message_id: str, delivered_id: int = Query(default=0)) -> ReadReceiptOk:
+    """MAX-процесс вызывает после успешного ``client.read_message``.
+    Проставляет ``read_at = now()`` для записи ``DeliveredMessage`` —
+    чтобы больше её не брать.
+    """
+    if delivered_id > 0:
+        db.mark_delivered_as_read(delivered_id)
+        return ReadReceiptOk(ok=True, marked=1)
+    # Фолбэк: ищем по (chat_id, message_id) и помечаем первую
+    # непрочитанную запись.
+    with db.session_scope() as s:
+        from shared.db import DeliveredMessage
+        row = (
+            s.query(DeliveredMessage)
+            .filter(
+                DeliveredMessage.max_chat_id == str(chat_id),
+                DeliveredMessage.max_message_id == str(message_id),
+                DeliveredMessage.read_at.is_(None),
+            )
+            .order_by(DeliveredMessage.id.asc())
+            .first()
+        )
+        if row is not None:
+            row.read_at = datetime.utcnow()
+            return ReadReceiptOk(ok=True, marked=1)
+    return ReadReceiptOk(ok=True, marked=0)
 
 
 @app.post("/chats", response_model=OkOut, dependencies=[Depends(verify_api_key)])
