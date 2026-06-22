@@ -37,6 +37,7 @@ from app.config import settings
 from app.keyboards import (
     AuthActionCallback,
     EventActionCallback,
+    SessionUseCallback,
     auth_choice_keyboard,
     event_inline_keyboard,
     main_reply_keyboard,
