@@ -324,10 +324,18 @@ async def _read_receipts_loop(
     ``client_getter`` — callable, возвращающий текущий ``Client`` (или ``None``,
     если Client ещё не поднят). Это позволяет не пересоздавать Client при
     рестарте: supervisor читает ``client`` из своей переменной через замыкание.
+
+    Адаптивный backoff: при последовательных ошибках увеличиваем интервал опроса:
+      * 1-3 ошибок подряд — 3 сек (нормальный ритм),
+      * 4-5 ошибок       — 30 сек,
+      * 6+ ошибок        — 600 сек (10 минут).
+    Это нужно, чтобы не спамить MAX-сервер proto.payload-ошибками и не
+    ловить rate-limit. Сброс счётчика при первом успехе.
     """
     logger.info(
         "read_receipts_loop started (poll=%.1fs)", READ_RECEIPTS_INTERVAL,
     )
+    consecutive_errors = 0
     while not stop_event.is_set():
         try:
             client = client_getter()
@@ -343,6 +351,7 @@ async def _read_receipts_loop(
 
             receipts = await _claim_pending_reads(stop_event)
             if not receipts:
+                consecutive_errors = 0
                 try:
                     await asyncio.wait_for(
                         stop_event.wait(), timeout=READ_RECEIPTS_INTERVAL
@@ -354,6 +363,7 @@ async def _read_receipts_loop(
             logger.info(
                 "read_receipts_loop: %d pending receipts to mark", len(receipts),
             )
+            had_error_in_batch = False
             for r in receipts:
                 if stop_event.is_set():
                     break
@@ -375,9 +385,25 @@ async def _read_receipts_loop(
                     )
                     continue
                 try:
+                    msg_id_int = int(msg_id_str)
+                except ValueError:
+                    logger.warning(
+                        "read_receipts_loop: cannot convert message_id=%r to int, "
+                        "marking as read in API to avoid retry",
+                        msg_id_str,
+                    )
+                    # Чтобы не зацикливаться на невалидном id — помечаем как прочитанное.
+                    await _mark_message_read(
+                        delivered_id=delivered_id,
+                        max_chat_id=chat_id_str,
+                        max_message_id=msg_id_str,
+                    )
+                    continue
+                try:
                     # PyMax: client.read_message(message_id, chat_id) -> ReadState
+                    # Важно: message_id — int (см. ошибку "Expected number at 42").
                     await client.read_message(
-                        message_id=msg_id_str, chat_id=chat_id_int,
+                        message_id=msg_id_int, chat_id=chat_id_int,
                     )
                     logger.info(
                         "read_message ok: chat=%s msg=%s",
@@ -393,13 +419,38 @@ async def _read_receipts_loop(
                         "read_message FAILED chat=%s msg=%s: %s",
                         chat_id_str, msg_id_str, exc,
                     )
+                    had_error_in_batch = True
                     # Не помечаем как прочитанное — попробуем в следующем тике.
+
+            if had_error_in_batch:
+                consecutive_errors += 1
+            else:
+                consecutive_errors = 0
+
+            if consecutive_errors <= 3:
+                current_interval = READ_RECEIPTS_INTERVAL  # 3s
+            elif consecutive_errors <= 5:
+                current_interval = 30.0
+            else:
+                current_interval = 600.0  # 10 минут
+            if consecutive_errors in (4, 6):
+                logger.warning(
+                    "read_receipts_loop: %d consecutive errors, backing off to %.0fs",
+                    consecutive_errors, current_interval,
+                )
         except Exception as exc:
             logger.warning("read_receipts_loop tick error: %s", exc)
+            consecutive_errors += 1
+            if consecutive_errors <= 3:
+                current_interval = READ_RECEIPTS_INTERVAL
+            elif consecutive_errors <= 5:
+                current_interval = 30.0
+            else:
+                current_interval = 600.0
 
         try:
             await asyncio.wait_for(
-                stop_event.wait(), timeout=READ_RECEIPTS_INTERVAL
+                stop_event.wait(), timeout=current_interval,
             )
         except asyncio.TimeoutError:
             continue
