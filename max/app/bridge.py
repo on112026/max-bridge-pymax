@@ -194,6 +194,37 @@ def register_bridge(client) -> None:
         except Exception as exc:
             logger.warning("on_start: post auth_state ok failed: %s", exc)
 
+        # Синхронизируем список чатов MAX с БД. Без этого /chats в боте
+        # показывает пустой список, потому что @on_chat_update срабатывает
+        # только при активности в чате (новое сообщение, переименование и
+        # т.п.), а на старте MAX может не отправить ни одного события.
+        try:
+            chats_attr = getattr(client, "chats", None)
+            if chats_attr is None and hasattr(client, "get_chats"):
+                chats_attr = client.get_chats
+            chats_list: Optional[list] = None
+            if callable(chats_attr):
+                try:
+                    chats_list = await chats_attr()
+                except TypeError:
+                    chats_list = chats_attr()
+            elif chats_attr is not None:
+                chats_list = chats_attr
+            if chats_list:
+                synced = 0
+                for chat in chats_list:
+                    try:
+                        await _post("/chats", _chat_to_dict(chat))
+                        synced += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "chat upsert on start failed for %s: %s",
+                            getattr(chat, "id", "?"), exc,
+                        )
+                logger.info("synced %d chats on start", synced)
+        except Exception as exc:
+            logger.warning("on_start: fetch chats failed: %s", exc)
+
     @client.on_chat_update()
     async def _on_chat_update(chat: MaxChat) -> None:
         try:
