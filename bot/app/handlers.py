@@ -388,14 +388,18 @@ async def upload_session_command(message: types.Message, state: FSMContext) -> N
 
 
 async def setup_command(message: types.Message) -> None:
-    """Создаёт приватную supergroup (forum) для пользователя.
+    """Инструкция по подключению supergroup (forum) для пересылки событий MAX.
 
-    - Если группа уже создана — присылает существующий invite_link.
-    - Если нет — создаёт через ``bot.create_supergroup``, включает топики
-      (``set_chat_is_forum``) и сохраняет в БД.
+    ВНИМАНИЕ: Telegram Bot API **не позволяет ботам создавать supergroups**
+    напрямую. Это всегда делается либо через клиентский MTProto (TDesktop,
+    Telegram для Android/iOS), либо вручную в любом клиенте Telegram. После
+    того как supergroup создана и бот добавлен в неё как админ, владелец
+    присылает сюда ``chat_id`` через ``/setgroup <chat_id>``.
 
-    После создания пользователь должен перейти по ``invite_link`` и
-    нажать ``/start`` внутри группы.
+    Поведение:
+    * Если supergroup уже привязана — присылает её текущий ``invite_link``
+      и ``chat_id`` (для справки).
+    * Если нет — пошаговая инструкция по созданию вручную.
     """
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
@@ -405,53 +409,153 @@ async def setup_command(message: types.Message) -> None:
     if existing:
         link = existing.invite_link or "(см. /getlink)"
         await message.answer(
-            "ℹ️ Группа уже создана.\n\n"
+            "ℹ️ Supergroup уже подключена.\n\n"
             f"Название: <b>{_escape(existing.title or '—')}</b>\n"
-            f"ID: <code>{existing.supergroup_chat_id}</code>\n"
-            f"🔗 Ссылка: {link}"
+            f"chat_id: <code>{existing.supergroup_chat_id}</code>\n"
+            f"Топики (forum): {'включены ✅' if existing.is_forum_enabled else 'включите вручную ⚠️'}\n"
+            f"🔗 Ссылка: {link}\n\n"
+            "Если хотите сменить группу — выполните /setgroup <chat_id> ещё раз."
         )
         return
 
-    await message.answer("🛠 Создаю приватную группу… Подождите несколько секунд.")
-    try:
-        new_group = await message.bot.create_supergroup(title="MAX Bridge 🔒")
-    except Exception as exc:
-        logger.warning("create_supergroup failed: %s", exc)
+    await message.answer(
+        "🛠 <b>Настройка supergroup для моста MAX ↔ Telegram</b>\n\n"
+        "Telegram Bot API не умеет создавать supergroups напрямую, "
+        "поэтому нужно создать группу вручную (в любом клиенте Telegram).\n\n"
+        "<b>Шаги:</b>\n"
+        "1. В Telegram создайте новую группу (меню «Создать группу»).\n"
+        "2. <b>Включите топики</b>: Настройки группы → «Топики» (Topics).\n"
+        "3. Добавьте этого бота в группу и сделайте <b>админом</b> "
+        "(с правом «Управление топиками»).\n"
+        "4. Узнайте <code>chat_id</code> группы. Проще всего: "
+        "перешлите любое сообщение из группы боту @RawDataBot — "
+        "в ответе будет поле <code>forward_from_chat.id</code> "
+        "(формат <code>-100xxxxxxxxxx</code>).\n"
+        "5. Вернитесь сюда и выполните:\n"
+        "   <code>/setgroup <chat_id></code>\n\n"
+        "После этого бот начнёт пересылать события из MAX в эту группу "
+        "(каждый MAX-чат получит свой топик)."
+    )
+
+
+async def setgroup_command(message: types.Message) -> None:
+    """Привязать существующую supergroup (forum) к владельцу.
+
+    Использование: <code>/setgroup <chat_id></code>, где ``chat_id``
+    имеет формат <code>-100xxxxxxxxxx</code>. Бот проверит, что он
+    находится в группе и может создавать топики, после чего сохранит
+    привязку в БД. EventPoller сразу подхватит накопившиеся события.
+    """
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+
+    args = (message.text or "").split()
+    if len(args) < 2:
         await message.answer(
-            f"⚠️ Не удалось создать группу: {exc}\n"
-            "Проверьте, что бот может создавать группы (BotFather → /setprivacy → Disable)."
+            "Использование: <code>/setgroup <chat_id></code>\n"
+            "Формат <code>chat_id</code>: <code>-100xxxxxxxxxx</code> "
+            "(можно узнать через @RawDataBot)."
         )
         return
 
-    chat_id = new_group.id
-    invite_link = getattr(new_group, "invite_link", None)
-    title = getattr(new_group, "title", "MAX Bridge 🔒")
+    try:
+        chat_id = int(args[1].strip())
+    except ValueError:
+        await message.answer("⚠️ chat_id должен быть числом (формат -100xxxxxxxxxx).")
+        return
 
-    # Включаем топики (forum mode), если Bot API 7.0+.
+    # Проверим, что бот действительно состоит в этой группе и видит её.
+    try:
+        chat = await message.bot.get_chat(chat_id)
+    except Exception as exc:
+        await message.answer(
+            f"⚠️ Не удалось получить чат <code>{chat_id}</code>: {_escape(str(exc))}\n"
+            "Убедитесь, что бот добавлен в группу и имеет права админа."
+        )
+        return
+
+    chat_type = getattr(chat, "type", None)
+    if chat_type and "group" not in str(chat_type).lower():
+        await message.answer(
+            f"⚠️ Чат <code>{chat_id}</code> имеет тип <b>{_escape(str(chat_type))}</b>, "
+            "а нужен supergroup с включёнными топиками."
+        )
+        return
+
+    # Проверим, что бот — админ (нужны права на создание топиков).
+    try:
+        member = await message.bot.get_chat_member(chat_id, (await message.bot.get_me()).id)
+        status = getattr(member, "status", None)
+        if str(status) not in ("ChatMemberStatus.ADMINISTRATOR", "administrator", "creator"):
+            await message.answer(
+                "⚠️ Бот должен быть <b>админом</b> группы (с правом «Manage Topics»). "
+                "Сделайте бота админом и попробуйте /setgroup ещё раз."
+            )
+            return
+    except Exception as exc:
+        logger.warning("setgroup: get_chat_member failed for %s: %s", chat_id, exc)
+        await message.answer(
+            f"⚠️ Не удалось проверить права бота в группе: {_escape(str(exc))}"
+        )
+        return
+
+    # Включим forum mode (если ещё не включён).
     forum_ok = await ensure_forum_enabled(message.bot, chat_id)
+    if not forum_ok:
+        await message.answer(
+            "⚠️ Не удалось включить топики автоматически. Включите их вручную:\n"
+            "Настройки группы → Топики → Включить. Затем повторите /setgroup."
+        )
+        # Сохраняем всё равно, чтобы владелец мог доделать настройки и вернуться.
+        # Если топики не включены — EventPoller будет падать, но данные сохранятся.
 
-    # Сохраняем в БД.
+    # Получаем/создаём invite link.
+    invite_link = await export_invite_link(message.bot, chat_id)
+
+    title = getattr(chat, "title", None) or "MAX Bridge 🔒"
+
     shared_db.create_supergroup(
-        owner_user_id=owner_uid,
+        owner_user_id=message.from_user.id,
         supergroup_chat_id=chat_id,
         title=title,
         invite_link=invite_link,
         is_forum_enabled=forum_ok,
     )
 
-    # Если invite_link не пришёл автоматически — запрашиваем явно.
-    if not invite_link:
-        invite_link = await export_invite_link(message.bot, chat_id)
-        if invite_link:
-            shared_db.update_supergroup_invite_link(owner_uid, invite_link)
+    # Сбрасываем флаг «уже подсказали про /setup» в AuthWatcher (если он
+    # запущен в этом процессе). Чтобы при следующем всплеске undelivered
+    # снова получить подсказку, если группу позже удалят.
+    w = AuthWatcher.get_active()
+    if w is not None:
+        try:
+            w._supergroup_prompted_for.discard(message.from_user.id)
+        except Exception as exc:
+            logger.debug("setgroup: reset prompt flag failed: %s", exc)
 
     await message.answer(
-        "✅ Приватная группа создана!\n\n"
+        f"✅ Supergroup подключена!\n\n"
         f"Название: <b>{_escape(title)}</b>\n"
-        f"Топики (forum): {'включены ✅' if forum_ok else 'недоступны в этой версии API ⚠️'}\n\n"
-        f"🔗 Ссылка для входа:\n{invite_link or '(см. /getlink)'}\n\n"
-        "Пройдите по ссылке и нажмите /start внутри группы — после этого мост начнёт работать."
+        f"chat_id: <code>{chat_id}</code>\n"
+        f"Топики (forum): {'включены ✅' if forum_ok else '⚠️ включите вручную'}\n"
+        f"🔗 Invite: {invite_link or '(сгенерируйте вручную через /getlink)'}\n\n"
+        "Бот начнёт пересылать события из MAX в эту группу (каждый MAX-чат "
+        "получит свой топик). Уже накопленные события будут доставлены "
+        "автоматически в течение пары секунд."
     )
+
+    # Если были события «undelivered» — форсим один tick EventPoller'а
+    # нельзя (поллер сам крутится), но владельцу полезно увидеть мгновенный
+    # фидбек. Поэтому после /setgroup сразу дёрнем api.status и сообщим.
+    try:
+        s = await api.status()
+        undelivered = s.get("undelivered", 0)
+        if undelivered:
+            await message.answer(
+                f"📬 Сейчас в очереди <b>{undelivered}</b> непрочитанных событий — "
+                "через пару секунд они появятся в группе в своих топиках."
+            )
+    except Exception as exc:
+        logger.debug("setgroup: status check failed: %s", exc)
 
 
 async def getlink_command(message: types.Message) -> None:
@@ -1029,6 +1133,13 @@ async def auth_action_callback(
 # ---------- AuthWatcher: поллер auth_state ----------
 
 
+# Module-level реестр текущего ``AuthWatcher`` (один на процесс).
+# Нужен, чтобы ``setgroup_command`` мог сбросить флаг подсказки
+# «сделай /setup» при успешной привязке supergroup. Ключ — id,
+# чтобы можно было держать несколько watcher'ов в тестах.
+_active_auth_watcher: "dict[int, AuthWatcher]" = {}
+
+
 class AuthWatcher:
     """Каждые N секунд проверяет auth_state и:
 
@@ -1055,6 +1166,11 @@ class AuthWatcher:
         self._last_known_session_path: Optional[str] = None
         self._task: Optional[asyncio.Task] = None
         self._api_error_count: int = 0
+        # Множество owner_uid, для которых УЖЕ отправляли подсказку
+        # «есть undelivered, но supergroup не подключена — сделай /setup».
+        # Чтобы не спамить на каждом тике (3 секунды). Сбрасывается,
+        # когда владелец успешно делает /setgroup.
+        self._supergroup_prompted_for: set[int] = set()
 
     async def _notify_owner(self, text: str, reply_markup=None) -> None:
         for uid in settings.allowed_tg_user_ids:
@@ -1236,6 +1352,39 @@ class AuthWatcher:
         elif not session_path:
             self._last_known_session_path = None
 
+        # 6) Подсказка про /setup: если MAX авторизован (status=ok), есть
+        #    непрочитанные события из MAX, но владелец не подключил
+        #    supergroup для пересылки — напоминаем один раз. Чтобы не
+        #    спамить на каждом тике, держим set owner_uid, которым уже
+        #    отправили подсказку. Setgroup_command сбрасывает флаг.
+        if status == "ok":
+            undelivered = int(s.get("undelivered") or 0)
+            if undelivered > 0:
+                owner_uid = (
+                    settings.allowed_tg_user_ids[0]
+                    if settings.allowed_tg_user_ids else 0
+                )
+                if owner_uid and owner_uid not in self._supergroup_prompted_for:
+                    try:
+                        sg = shared_db.get_supergroup_for_owner(owner_uid)
+                    except Exception as exc:
+                        logger.debug(
+                            "auth_watcher: get_supergroup_for_owner failed: %s", exc,
+                        )
+                        sg = None
+                    if sg is None:
+                        self._supergroup_prompted_for.add(owner_uid)
+                        await self._notify_owner(
+                            f"📬 У вас <b>{undelivered}</b> непрочитанных событий из MAX, "
+                            "но бот пока не знает, в какую группу их пересылать.\n"
+                            "Сделайте <code>/setup</code> — пришлю инструкцию "
+                            "по созданию supergroup."
+                        )
+            else:
+                # Нет непрочитанных — сбрасываем флаг, чтобы при следующем
+                # всплеске событий снова напомнить.
+                self._supergroup_prompted_for.clear()
+
     async def _run(self) -> None:
         logger.info("AuthWatcher started (poll=%.1fs)", self.POLL_INTERVAL)
         while True:
@@ -1250,6 +1399,9 @@ class AuthWatcher:
     def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="auth-watcher")
+            # Регистрируем себя в module-level реестре, чтобы
+            # ``setgroup_command`` мог сбросить флаг подсказки.
+            _active_auth_watcher[id(self)] = self
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -1259,6 +1411,19 @@ class AuthWatcher:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        _active_auth_watcher.pop(id(self), None)
+
+    @staticmethod
+    def get_active() -> "Optional[AuthWatcher]":
+        """Возвращает текущий активный watcher (один на процесс) или ``None``.
+
+        Используется ``setgroup_command``, чтобы сбросить флаг «уже
+        подсказали про /setup» после успешной привязки supergroup.
+        """
+        if not _active_auth_watcher:
+            return None
+        # Возвращаем последний запущенный (LIFO) — в проде он ровно один.
+        return next(reversed(_active_auth_watcher.values()))
 
 
 # ---------- Регистрация ----------
@@ -1277,6 +1442,7 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(upload_session_command, Command("upload_session"))
     dp.message.register(sessions_command, Command("sessions"))
     dp.message.register(setup_command, Command("setup"))
+    dp.message.register(setgroup_command, Command("setgroup"))
     dp.message.register(getlink_command, Command("getlink"))
 
     dp.message.register(button_status, F.text == "ℹ️ Статус")
