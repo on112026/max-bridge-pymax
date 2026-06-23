@@ -65,6 +65,17 @@ async def _claim_next() -> Optional[dict]:
     return None
 
 
+def _log_thread_id(item_id: int, target_chat_id: str, thread_id: Optional[int]) -> None:
+    """Логируем ``thread_id`` (для отладки и будущей синхронизации с TG-топиками)."""
+    if thread_id:
+        logger.info(
+            "send item id=%s thread_id=%s chat=%s (ответ из TG-топика)",
+            item_id, thread_id, target_chat_id,
+        )
+    else:
+        logger.info("send item id=%s chat=%s", item_id, target_chat_id)
+
+
 async def _finish(item_id: int, ok: bool, error: Optional[str] = None) -> None:
     try:
         async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
@@ -120,6 +131,13 @@ async def sender_loop(client, stop_event) -> None:
         item_id = item.get("id")
         if not item_id:
             continue
+        # ``thread_id`` (если есть) пришёл из TG-топика — логируем для
+        # трассировки и будущей синхронизации ``chat.read_at`` с TG.
+        _log_thread_id(
+            item_id=item_id,
+            target_chat_id=item.get("target_chat_id", ""),
+            thread_id=item.get("thread_id"),
+        )
         ok, err = await _send_one(client, item)
         await _finish(item_id, ok=ok, error=err)
         logger.info("send item id=%s ok=%s err=%s", item_id, ok, err)

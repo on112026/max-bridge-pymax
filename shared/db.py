@@ -80,6 +80,11 @@ class SendQueue(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     finished_at = Column(DateTime, nullable=True)
+    # Если пользователь ответил из топика в Telegram — бот сохраняет
+    # ``thread_id`` здесь, чтобы MAX-процесс мог пометить этот топик как
+    # прочитанный (``mark_chat_read_up_to`` уже используется в боте; ниже
+    # мы просто дополним thread_id в sender.py).
+    thread_id = Column(Integer, nullable=True)
 
 
 class AuthState(Base):
@@ -163,6 +168,46 @@ class ChatReadState(Base):
     __tablename__ = "chat_read_state"
     max_chat_id = Column(String, primary_key=True)
     last_read_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SuperGroup(Base):
+    """Telegram private supergroup (1 per owner), в которую бот пересылает
+    события из MAX. Создаётся через ``/setup``, используется всеми
+    forward-ами бота для этого пользователя.
+
+    Хранит ``invite_link``, чтобы пользователь мог повторно открыть
+    приватную группу (или поделиться с доверенным лицом).
+    """
+
+    __tablename__ = "super_groups"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id = Column(Integer, unique=True, index=True, nullable=False)
+    supergroup_chat_id = Column(Integer, nullable=False)
+    title = Column(String, nullable=True)
+    invite_link = Column(String, nullable=True)
+    # Запоминаем, включён ли forum mode — чтобы при первом запуске можно
+    # было понять, нужно ли включать ``is_forum`` (Bot API 7.0+).
+    is_forum_enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ChatTopic(Base):
+    """Связь между MAX-чатом и Telegram-топиком в супергруппе.
+
+    Каждый уникальный ``max_chat_id`` получает свой топик внутри
+    supergroup. Топики создаются автоматически при первом входящем
+    сообщении из MAX (``forwarder.py::get_or_create_topic``).
+    """
+
+    __tablename__ = "chat_topics"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    max_chat_id = Column(String, unique=True, index=True, nullable=False)
+    supergroup_chat_id = Column(Integer, nullable=False)
+    thread_id = Column(Integer, nullable=False)
+    # Сохраняем чистое имя (chat.title из MAX) — без префикса "(MAX: ...)",
+    # который мы добавляем при создании топика.
+    topic_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # Маппинг SQLAlchemy-типов на компактные имена SQLite-типов, которые мы
@@ -422,6 +467,9 @@ def enqueue_send(item: dict) -> int:
             created_by=item.get("created_by"),
             status="pending",
         )
+        thread_id = item.get("thread_id")
+        if thread_id is not None:
+            row.thread_id = int(thread_id)
         s.add(row)
         s.flush()
         return row.id
@@ -757,3 +805,127 @@ def mark_delivered_as_read(delivered_id: int) -> None:
         if not row:
             return
         row.read_at = datetime.utcnow()
+
+
+# --- Telegram supergroup + topics ---
+
+
+def get_supergroup_for_owner(owner_user_id: int) -> Optional[SuperGroup]:
+    """Возвращает supergroup владельца или ``None`` если ещё не создал."""
+    with session_scope() as s:
+        row = (
+            s.query(SuperGroup)
+            .filter(SuperGroup.owner_user_id == int(owner_user_id))
+            .first()
+        )
+        if not row:
+            return None
+        s.expunge(row)
+        return row
+
+
+def create_supergroup(
+    owner_user_id: int,
+    supergroup_chat_id: int,
+    title: str,
+    invite_link: Optional[str] = None,
+    is_forum_enabled: bool = True,
+) -> None:
+    """Создать запись о приватной supergroup для пользователя.
+
+    Если запись уже существует — обновляет ``supergroup_chat_id`` / ``invite_link``.
+    """
+    with session_scope() as s:
+        existing = (
+            s.query(SuperGroup)
+            .filter(SuperGroup.owner_user_id == int(owner_user_id))
+            .first()
+        )
+        if existing:
+            existing.supergroup_chat_id = int(supergroup_chat_id)
+            existing.title = title
+            existing.invite_link = invite_link
+            existing.is_forum_enabled = bool(is_forum_enabled)
+            return
+        s.add(SuperGroup(
+            owner_user_id=int(owner_user_id),
+            supergroup_chat_id=int(supergroup_chat_id),
+            title=title,
+            invite_link=invite_link,
+            is_forum_enabled=bool(is_forum_enabled),
+        ))
+
+
+def update_supergroup_invite_link(
+    owner_user_id: int, invite_link: str
+) -> None:
+    """Обновить ``invite_link`` (например, после ``export_chat_invite_link``)."""
+    with session_scope() as s:
+        row = (
+            s.query(SuperGroup)
+            .filter(SuperGroup.owner_user_id == int(owner_user_id))
+            .first()
+        )
+        if row:
+            row.invite_link = invite_link
+
+
+def get_topic(max_chat_id: str) -> Optional[ChatTopic]:
+    """Возвращает топик для ``max_chat_id`` или ``None``."""
+    with session_scope() as s:
+        row = (
+            s.query(ChatTopic)
+            .filter(ChatTopic.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if not row:
+            return None
+        s.expunge(row)
+        return row
+
+
+def create_topic(
+    max_chat_id: str,
+    supergroup_chat_id: int,
+    thread_id: int,
+    topic_name: Optional[str] = None,
+) -> None:
+    """Создать запись о топике. Идемпотентно: если уже есть — не трогает."""
+    with session_scope() as s:
+        existing = (
+            s.query(ChatTopic)
+            .filter(ChatTopic.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if existing:
+            return
+        s.add(ChatTopic(
+            max_chat_id=str(max_chat_id),
+            supergroup_chat_id=int(supergroup_chat_id),
+            thread_id=int(thread_id),
+            topic_name=topic_name,
+        ))
+
+
+def update_topic_name(max_chat_id: str, topic_name: str) -> None:
+    """Обновить ``topic_name`` (например, при ``on_chat_update`` из MAX)."""
+    with session_scope() as s:
+        row = (
+            s.query(ChatTopic)
+            .filter(ChatTopic.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if row and row.topic_name != topic_name:
+            row.topic_name = topic_name
+
+
+def list_topics() -> List[ChatTopic]:
+    """Все топики (используется при старте для логов)."""
+    with session_scope() as s:
+        rows = (
+            s.query(ChatTopic)
+            .order_by(ChatTopic.created_at.asc())
+            .all()
+        )
+        s.expunge_all()
+        return list(rows)

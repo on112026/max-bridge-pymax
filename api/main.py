@@ -114,6 +114,10 @@ class SendIn(BaseModel):
     media_mime: Optional[str] = None
     media_filename: Optional[str] = None
     created_by: Optional[int] = None
+    # ``thread_id`` — id топика в Telegram supergroup, из которого
+    # пользователь отправил сообщение. Передаётся через ``enqueue_send``
+    # в ``SendQueue.thread_id`` (см. ``shared/db.py``).
+    thread_id: Optional[int] = None
 
 
 class SendOut(BaseModel):
@@ -128,6 +132,7 @@ class SendOut(BaseModel):
     error: Optional[str] = None
     created_at: Optional[str] = None
     finished_at: Optional[str] = None
+    thread_id: Optional[int] = None
 
 
 class StatusOut(BaseModel):
@@ -184,6 +189,10 @@ def _send_to_out(s) -> SendOut:
         error=s.error,
         created_at=s.created_at.isoformat() if s.created_at else None,
         finished_at=s.finished_at.isoformat() if s.finished_at else None,
+        # ``thread_id`` (id TG-топика, из которого отправлено сообщение)
+        # — пробрасываем в ответ, чтобы клиент мог проверить, что поле
+        # корректно сохранилось в ``SendQueue``. См. ``shared/db.py::SendQueue``.
+        thread_id=s.thread_id,
     )
 
 

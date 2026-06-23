@@ -63,6 +63,7 @@ async def forward_event(
     target_chat_id: int,
     event: Dict[str, Any],
     reply_markup: Optional[InlineKeyboardMarkup] = None,
+    message_thread_id: Optional[int] = None,
 ) -> Optional[Message]:
     """Переслать событие из MAX в Telegram.
 
@@ -71,6 +72,9 @@ async def forward_event(
     клавиатуру приходилось слать отдельным сообщением-заглушкой «—»,
     что разрывало связь кнопок с контекстом и через 48ч Telegram
     запрещал нажимать на них.
+
+    ``message_thread_id`` (опционально) — id топика в супергруппе
+    (см. ``app/topics.py``). Если задан, сообщение уходит в топик.
     """
     kind = (event.get("kind") or "text").lower()
     media_path = event.get("media_path")
@@ -83,6 +87,7 @@ async def forward_event(
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
 
     abs_path = _abs_media_path(media_path)
@@ -92,6 +97,7 @@ async def forward_event(
             text=_caption(event, header) + "\n\n<i>(медиафайл не найден)</i>",
             parse_mode="HTML",
             reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
 
     size = os.path.getsize(abs_path)
@@ -105,6 +111,7 @@ async def forward_event(
             text=_caption(event, header) + f"\n\n<i>Файл больше 50 МБ ({size // 1024 // 1024} МБ) — в MAX</i>",
             parse_mode="HTML",
             reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
         return msg
 
@@ -112,32 +119,41 @@ async def forward_event(
         return await bot.send_photo(
             chat_id=target_chat_id, photo=doc, caption=cap[:1024],
             parse_mode="HTML", reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
     if kind == "video":
         return await bot.send_video(
             chat_id=target_chat_id, video=doc, caption=cap[:1024],
             parse_mode="HTML", reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
     if kind == "voice":
         return await bot.send_voice(
             chat_id=target_chat_id, voice=doc, caption=cap[:1024],
             parse_mode="HTML", reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
     if kind == "video_note":
         try:
-            return await bot.send_video_note(chat_id=target_chat_id, video_note=doc)
+            return await bot.send_video_note(
+                chat_id=target_chat_id, video_note=doc,
+                message_thread_id=message_thread_id,
+            )
         except Exception:
             return await bot.send_document(
                 chat_id=target_chat_id, document=doc, caption=cap[:1024],
                 parse_mode="HTML", reply_markup=reply_markup,
+                message_thread_id=message_thread_id,
             )
     if kind in ("audio", "sticker", "document", "other"):
         return await bot.send_document(
             chat_id=target_chat_id, document=doc, caption=cap[:1024],
             parse_mode="HTML", reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
 
     return await bot.send_document(
         chat_id=target_chat_id, document=doc, caption=cap[:1024],
         parse_mode="HTML", reply_markup=reply_markup,
+        message_thread_id=message_thread_id,
     )

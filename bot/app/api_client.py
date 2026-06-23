@@ -61,6 +61,7 @@ class BotApi:
         media_mime: Optional[str] = None,
         media_filename: Optional[str] = None,
         created_by: Optional[int] = None,
+        thread_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         payload = {
             "target_chat_id": target_chat_id,
@@ -70,6 +71,7 @@ class BotApi:
             "media_mime": media_mime,
             "media_filename": media_filename,
             "created_by": created_by,
+            "thread_id": thread_id,
         }
         return await self._client.enqueue_send(payload)
 

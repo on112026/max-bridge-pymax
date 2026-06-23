@@ -37,16 +37,23 @@ async def main() -> None:
     dp = Dispatcher()
     register_handlers(dp)
 
+    # Владелец — первый (и пока единственный) user_id из ALLOWED_TG_USER_IDS.
+    # EventPoller использует его для lookup supergroup (создаётся через /setup)
+    # и для создания/поиска топика для каждого MAX-чата.
+    owner_uid = (
+        settings.allowed_tg_user_ids[0] if settings.allowed_tg_user_ids else 0
+    )
+
     poller = EventPoller(
         bot=bot,
-        target_chat_id=settings.allowed_tg_user_ids[0] if settings.allowed_tg_user_ids else 0,
+        owner_user_id=owner_uid,
         poll_interval=2.0,
     )
 
     auth_watcher = AuthWatcher(bot=bot)
 
     try:
-        if poller.target_chat_id:
+        if owner_uid:
             await poller.start()
         auth_watcher.start()
         await dp.start_polling(bot)

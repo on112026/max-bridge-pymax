@@ -45,6 +45,8 @@ from app.keyboards import (
 from app.sender import forward_event
 from app.states import ReplyState, ReauthSmsState, UploadSessionState
 from app.keyboards import session_use_keyboard
+from app.topics import ensure_forum_enabled, export_invite_link
+from shared import db as shared_db
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +384,95 @@ async def upload_session_command(message: types.Message, state: FSMContext) -> N
     await button_upload_session(message, state)
 
 
+# ---------- /setup — создание приватной Telegram-группы для моста ----------
+
+
+async def setup_command(message: types.Message) -> None:
+    """Создаёт приватную supergroup (forum) для пользователя.
+
+    - Если группа уже создана — присылает существующий invite_link.
+    - Если нет — создаёт через ``bot.create_supergroup``, включает топики
+      (``set_chat_is_forum``) и сохраняет в БД.
+
+    После создания пользователь должен перейти по ``invite_link`` и
+    нажать ``/start`` внутри группы.
+    """
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+
+    owner_uid = message.from_user.id
+    existing = shared_db.get_supergroup_for_owner(owner_uid)
+    if existing:
+        link = existing.invite_link or "(см. /getlink)"
+        await message.answer(
+            "ℹ️ Группа уже создана.\n\n"
+            f"Название: <b>{_escape(existing.title or '—')}</b>\n"
+            f"ID: <code>{existing.supergroup_chat_id}</code>\n"
+            f"🔗 Ссылка: {link}"
+        )
+        return
+
+    await message.answer("🛠 Создаю приватную группу… Подождите несколько секунд.")
+    try:
+        new_group = await message.bot.create_supergroup(title="MAX Bridge 🔒")
+    except Exception as exc:
+        logger.warning("create_supergroup failed: %s", exc)
+        await message.answer(
+            f"⚠️ Не удалось создать группу: {exc}\n"
+            "Проверьте, что бот может создавать группы (BotFather → /setprivacy → Disable)."
+        )
+        return
+
+    chat_id = new_group.id
+    invite_link = getattr(new_group, "invite_link", None)
+    title = getattr(new_group, "title", "MAX Bridge 🔒")
+
+    # Включаем топики (forum mode), если Bot API 7.0+.
+    forum_ok = await ensure_forum_enabled(message.bot, chat_id)
+
+    # Сохраняем в БД.
+    shared_db.create_supergroup(
+        owner_user_id=owner_uid,
+        supergroup_chat_id=chat_id,
+        title=title,
+        invite_link=invite_link,
+        is_forum_enabled=forum_ok,
+    )
+
+    # Если invite_link не пришёл автоматически — запрашиваем явно.
+    if not invite_link:
+        invite_link = await export_invite_link(message.bot, chat_id)
+        if invite_link:
+            shared_db.update_supergroup_invite_link(owner_uid, invite_link)
+
+    await message.answer(
+        "✅ Приватная группа создана!\n\n"
+        f"Название: <b>{_escape(title)}</b>\n"
+        f"Топики (forum): {'включены ✅' if forum_ok else 'недоступны в этой версии API ⚠️'}\n\n"
+        f"🔗 Ссылка для входа:\n{invite_link or '(см. /getlink)'}\n\n"
+        "Пройдите по ссылке и нажмите /start внутри группы — после этого мост начнёт работать."
+    )
+
+
+async def getlink_command(message: types.Message) -> None:
+    """Получить/пересоздать invite-ссылку на приватную группу."""
+    if not _is_allowed(message.from_user.id):
+        return await _reject(message)
+    sg = shared_db.get_supergroup_for_owner(message.from_user.id)
+    if not sg:
+        await message.answer(
+            "ℹ️ Группа ещё не создана. Используйте /setup."
+        )
+        return
+    new_link = await export_invite_link(message.bot, sg.supergroup_chat_id)
+    if new_link:
+        shared_db.update_supergroup_invite_link(message.from_user.id, new_link)
+    await message.answer(
+        f"🔗 Ссылка на группу «{_escape(sg.title or '—')}»:\n"
+        f"{new_link or sg.invite_link or '(не удалось получить)'}"
+    )
+
+
 # ---------- Reply FSM (отправка в MAX) ----------
 
 
@@ -392,14 +483,33 @@ async def reply_command(message: types.Message, state: FSMContext) -> None:
     if len(args) < 2:
         await message.answer("Использование: /reply <chat_id>")
         return
-    await state.set_state(ReplyState.waiting_text)
-    await state.update_data(target_chat_id=args[1])
-    await message.answer(
-        f"✍️ Введите сообщение для чата <code>{_escape(args[1])}</code>.\n"
-        "Можно отправить фото/видео/документ — всё уйдёт туда.\n"
-        "/cancel — выйти.",
-        parse_mode="HTML",
+    # Если пользователь вызвал /reply внутри топика supergroup — запоминаем
+    # message_thread_id, чтобы ответ ушёл в тот же топик.
+    thread_id = (
+        message.message_thread_id
+        if getattr(message, "is_topic_message", False)
+        else None
     )
+    await state.set_state(ReplyState.waiting_text)
+    await state.update_data(
+        target_chat_id=args[1],
+        thread_id=thread_id,
+    )
+    if thread_id:
+        await message.answer(
+            f"✍️ Введите сообщение для чата <code>{_escape(args[1])}</code> "
+            "(в текущий топик).\n"
+            "Можно отправить фото/видео/документ.\n"
+            "/cancel — выйти.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"✍️ Введите сообщение для чата <code>{_escape(args[1])}</code>.\n"
+            "Можно отправить фото/видео/документ — всё уйдёт туда.\n"
+            "/cancel — выйти.",
+            parse_mode="HTML",
+        )
 
 
 async def reply_text(message: types.Message, state: FSMContext) -> None:
@@ -411,12 +521,19 @@ async def reply_text(message: types.Message, state: FSMContext) -> None:
         await state.clear()
         return
     text = message.text or ""
+    thread_id = data.get("thread_id")
     try:
         res = await api.enqueue_send(
-            target_chat_id=target, kind="text", text=text, created_by=message.from_user.id
+            target_chat_id=target,
+            kind="text",
+            text=text,
+            created_by=message.from_user.id,
+            thread_id=thread_id,
         )
         await message.answer(
-            f"✅ Отправлено в очередь (id={res.get('id')}). Дождитесь подтверждения от MAX."
+            f"✅ Отправлено в очередь (id={res.get('id')}). "
+            "Дождитесь подтверждения от MAX."
+            + (f"\n🧵 Ответ уйдёт в топик {thread_id}." if thread_id else "")
         )
     except Exception as exc:
         await message.answer(f"⚠️ Ошибка постановки в очередь: {exc}")
@@ -457,6 +574,7 @@ async def reply_media(message: types.Message, state: FSMContext) -> None:
         await message.answer("Не удалось получить файл.")
         return
 
+    thread_id = data.get("thread_id")
     try:
         tg_file = await message.bot.get_file(file_id)
         if tg_file.file_size and tg_file.file_size > MAX_TG_DOWNLOAD:
@@ -475,10 +593,12 @@ async def reply_media(message: types.Message, state: FSMContext) -> None:
             media_mime=message.content_type,
             media_filename=local_name,
             created_by=message.from_user.id,
+            thread_id=thread_id,
         )
         await message.answer(
             f"📨 Медиа поставлено в очередь (id={res.get('id')}, {kind}). "
             "Дождитесь подтверждения от MAX."
+            + (f"\n🧵 Ответ уйдёт в топик {thread_id}." if thread_id else "")
         )
     except Exception as exc:
         await message.answer(f"⚠️ Ошибка: {exc}")
@@ -1156,6 +1276,8 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(cancel_command, Command("cancel"))
     dp.message.register(upload_session_command, Command("upload_session"))
     dp.message.register(sessions_command, Command("sessions"))
+    dp.message.register(setup_command, Command("setup"))
+    dp.message.register(getlink_command, Command("getlink"))
 
     dp.message.register(button_status, F.text == "ℹ️ Статус")
     dp.message.register(button_chats, F.text == "📚 Чаты")
