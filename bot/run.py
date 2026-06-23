@@ -18,6 +18,7 @@ from app.api_client import api
 from app.config import settings
 from app.forwarder import EventPoller
 from app.handlers import AuthWatcher, register_handlers
+from shared import db as shared_db
 from shared.log_setup import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 async def main() -> None:
     configure_logging(settings.log_level)
+    # Инициализируем DB engine в bot-процессе (та же БД ``settings.db_path``,
+    # которую использует api-процесс и max-процесс). Без этого
+    # ``shared_db.*`` в ``handlers.py`` (``get_supergroup_for_owner``,
+    # ``create_supergroup``, ``update_supergroup_invite_link``) и в
+    # ``forwarder.py`` (``get_supergroup_for_owner``) падают с
+    # ``RuntimeError: DB engine не инициализирован``.
+    # ``init_engine`` идемпотентна (``if _engine is not None: return``).
+    shared_db.init_engine(settings.db_path)
     token = settings.telegram_bot_token
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is empty")
