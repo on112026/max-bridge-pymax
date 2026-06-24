@@ -122,7 +122,9 @@ class UploadService:
 
         try:
             async with (
-                aiohttp.ClientSession(proxy=self.app.config.proxy) as session,
+                aiohttp.ClientSession(
+                    **({"proxy": self.app.config.proxy} if self.app.config.proxy else {}),
+                ) as session,
                 session.post(
                     url=url,
                     data=form,
@@ -252,7 +254,8 @@ class UploadService:
 
         try:
             async with aiohttp.ClientSession(
-                timeout=timeout, proxy=self.app.config.proxy
+                timeout=timeout,
+                **({"proxy": self.app.config.proxy} if self.app.config.proxy else {}),
             ) as session:
                 logger.debug("Starting video upload HTTP request video_id=%s", video_id)
 
@@ -374,7 +377,7 @@ class UploadService:
 
         try:
             async with aiohttp.ClientSession(
-                proxy=self.app.config.proxy,
+                **({"proxy": self.app.config.proxy} if self.app.config.proxy else {}),
             ) as session:
                 async with session.post(
                     url=upload_info.url,
