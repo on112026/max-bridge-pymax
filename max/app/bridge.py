@@ -320,12 +320,31 @@ def register_bridge(client) -> None:
                         if peer_id is not None:
                             users_map = getattr(client, "users", None) or {}
                             user = users_map.get(peer_id)
+                            found_after_fetch = user is not None
+                            # Если peer'а нет в кеше — догружаем с сервера.
+                            # ``client.get_user`` есть в pymax (см.
+                            # ``vendor/pymax/infra/user.py:33``) и сам кладёт
+                            # результат в ``client.users[peer_id]``.
+                            if user is None and hasattr(client, "get_user"):
+                                try:
+                                    fetched = await client.get_user(peer_id)
+                                    if fetched is not None:
+                                        user = fetched
+                                        found_after_fetch = True
+                                        try:
+                                            users_map[peer_id] = fetched
+                                        except Exception:
+                                            pass
+                                except Exception as exc:
+                                    logger.info(
+                                        "get_user(%s) failed: %s", peer_id, exc,
+                                    )
                             chat_title = _user_display_name(user)
                             logger.info(
                                 "bridge DIALOG path: chat=%s me_id=%s peer_id=%s "
-                                "users_count=%d found=%s title=%r",
+                                "users_count=%d found=%s found_after_fetch=%s title=%r",
                                 chat_id, me_id, peer_id, users_count,
-                                user is not None, chat_title,
+                                user is not None, found_after_fetch, chat_title,
                             )
                 except Exception as exc:
                     logger.info("lookup dialog peer for %s failed: %s", chat_id, exc)
