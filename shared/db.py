@@ -884,6 +884,31 @@ def get_topic(max_chat_id: str) -> Optional[ChatTopic]:
         return row
 
 
+def get_topic_by_thread_id(
+    supergroup_chat_id: int, thread_id: int
+) -> Optional[ChatTopic]:
+    """Обратный lookup: топик по ``(supergroup_chat_id, thread_id)``.
+
+    Используется «эхо»-хэндлером бота, который при получении сообщения
+    в топике супергруппы должен понять, в какой MAX-чат его отправить.
+    Возвращает ``None``, если такого топика нет (например, кто-то
+    вручную создал топик в группе или привязка ещё не появилась).
+    """
+    with session_scope() as s:
+        row = (
+            s.query(ChatTopic)
+            .filter(
+                ChatTopic.supergroup_chat_id == int(supergroup_chat_id),
+                ChatTopic.thread_id == int(thread_id),
+            )
+            .first()
+        )
+        if not row:
+            return None
+        s.expunge(row)
+        return row
+
+
 def create_topic(
     max_chat_id: str,
     supergroup_chat_id: int,
