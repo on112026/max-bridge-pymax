@@ -239,13 +239,69 @@ def register_bridge(client) -> None:
                 return
             chat_id = str(message.chat_id)
             msg_id = str(message.id)
-            chat = client.chats
-            chat_title = None
-            if isinstance(chat, list):
-                for c in chat:
-                    if str(c.id) == chat_id:
-                        chat_title = c.title
-                        break
+
+            # 1) Пытаемся достать имя чата из локального кеша ``client.chats``
+            #    (заполняется на login/sync).
+            chat_title: Optional[str] = None
+            chat_info_obj = None
+            try:
+                cached = getattr(client, "chats", None)
+                if isinstance(cached, list):
+                    for c in cached:
+                        if str(c.id) == chat_id:
+                            chat_title = getattr(c, "title", None) or None
+                            chat_info_obj = c
+                            break
+            except Exception as exc:
+                logger.debug("lookup chat in client.chats failed for %s: %s", chat_id, exc)
+
+            # 2) Если в кеше нет (новый чат, личный диалог или sync ещё не
+            #    прошёл) — догружаем чат с сервера. ``client.get_chat`` есть
+            #    в pymax (см. ``vendor/pymax/infra/chat.py``).
+            if not chat_title:
+                try:
+                    chat_info_obj = await client.get_chat(int(chat_id))
+                    chat_title = getattr(chat_info_obj, "title", None) or None
+                except Exception as exc:
+                    logger.debug("get_chat for %s failed: %s", chat_id, exc)
+
+            # 3) Для личных диалогов MAX обычно не кладёт имя собеседника в
+            #    ``chat.title`` — оно лежит в ``client.users[user_id].name``.
+            #    Достаём user_id из ``chat.participants`` (user_id → role,
+            #    см. ``vendor/pymax/types/domain/chat.py``) и пропускаем себя.
+            if not chat_title and chat_info_obj is not None:
+                try:
+                    participants = getattr(chat_info_obj, "participants", None) or {}
+                    me_id = None
+                    me = getattr(client, "me", None)
+                    if me is not None:
+                        contact = getattr(me, "contact", None)
+                        me_id = getattr(contact, "id", None) if contact else None
+                    users_map = getattr(client, "users", None) or {}
+                    for uid in participants.keys():
+                        if me_id is not None and uid == me_id:
+                            continue
+                        user = users_map.get(uid)
+                        name = getattr(user, "name", None) if user else None
+                        if name:
+                            chat_title = name
+                            break
+                    # Если это DIALOG и participants пуст (бывает на старте),
+                    # пробуем вычислить собеседника перебором users_map.
+                    if (
+                        not chat_title
+                        and str(getattr(chat_info_obj, "type", "")) == "ChatType.DIALOG"
+                        and me_id is not None
+                    ):
+                        for uid in users_map.keys():
+                            if uid == me_id:
+                                continue
+                            candidate_name = getattr(users_map[uid], "name", None)
+                            if candidate_name:
+                                chat_title = candidate_name
+                                break
+                except Exception as exc:
+                    logger.debug("lookup user for dialog %s failed: %s", chat_id, exc)
 
             text = message.text or ""
             event: dict[str, Any] = {
@@ -284,6 +340,9 @@ def register_bridge(client) -> None:
                     logger.debug("skip attachment type=%s", getattr(att, "type", "?"))
 
             await _post("/events", event)
-            logger.info("forwarded message chat=%s msg=%s kind=%s", chat_id, msg_id, event.get("kind"))
+            logger.info(
+                "forwarded message chat=%s msg=%s kind=%s title=%r",
+                chat_id, msg_id, event.get("kind"), chat_title,
+            )
         except Exception as exc:
             logger.exception("on_message handler failed: %s", exc)
