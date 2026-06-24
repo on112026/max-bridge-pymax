@@ -40,6 +40,32 @@ def _headers() -> dict:
     return {"X-Api-Key": API_KEY}
 
 
+def _user_display_name(user: Any) -> Optional[str]:
+    """Собирает отображаемое имя из ``User.names`` (pymax).
+
+    У ``pymax.User`` нет поля ``name`` — есть ``names: list[Name]``,
+    где каждый ``Name`` содержит ``name`` (полное), ``first_name``,
+    ``last_name`` и ``type`` (см. ``vendor/pymax/types/domain/{user,name}.py``).
+    Возвращает наиболее приоритетный вариант.
+    """
+    if user is None:
+        return None
+    names_list = getattr(user, "names", None) or []
+    # 1) Приоритет — заполненное полное имя.
+    for n in names_list:
+        full = (getattr(n, "name", None) or "").strip()
+        if full:
+            return full
+    # 2) Fallback: склеить first_name + last_name из любой записи.
+    for n in names_list:
+        first = (getattr(n, "first_name", None) or "").strip()
+        last = (getattr(n, "last_name", None) or "").strip()
+        joined = (first + " " + last).strip()
+        if joined:
+            return joined
+    return None
+
+
 def _chat_to_dict(chat: MaxChat) -> dict:
     return {
         "max_chat_id": str(chat.id),
@@ -266,42 +292,55 @@ def register_bridge(client) -> None:
                     logger.debug("get_chat for %s failed: %s", chat_id, exc)
 
             # 3) Для личных диалогов MAX обычно не кладёт имя собеседника в
-            #    ``chat.title`` — оно лежит в ``client.users[user_id].name``.
-            #    Достаём user_id из ``chat.participants`` (user_id → role,
-            #    см. ``vendor/pymax/types/domain/chat.py``) и пропускаем себя.
+            #    ``chat.title`` — оно лежит в ``client.users[user_id].names``.
+            #    Для DIALOG ID чата строится как XOR двух user_id
+            #    (``first_user_id ^ second_user_id``, см.
+            #    ``vendor/pymax/api/users/service.py:get_chat_id``) — это
+            #    надёжнее перебора ``users_map``, потому что ``client.users``
+            #    может быть пуст на старте (sync ещё не прошёл).
+            if (
+                not chat_title
+                and chat_info_obj is not None
+                and str(getattr(chat_info_obj, "type", "")) == "DIALOG"
+            ):
+                try:
+                    me = getattr(client, "me", None)
+                    me_id = getattr(getattr(me, "contact", None), "id", None) if me else None
+                    if me_id is not None:
+                        try:
+                            peer_id = int(chat_id) ^ int(me_id)
+                        except (TypeError, ValueError):
+                            peer_id = None
+                        if peer_id is not None:
+                            users_map = getattr(client, "users", None) or {}
+                            user = users_map.get(peer_id)
+                            chat_title = _user_display_name(user)
+                            if chat_title:
+                                logger.debug(
+                                    "DIALOG %s: peer_id=%s name=%r",
+                                    chat_id, peer_id, chat_title,
+                                )
+                except Exception as exc:
+                    logger.debug("lookup dialog peer for %s failed: %s", chat_id, exc)
+
+            # 4) Fallback для групповых чатов, у которых ``chat.title`` пуст:
+            #    берём имя первого участника ≠ self из ``chat.participants``.
             if not chat_title and chat_info_obj is not None:
                 try:
                     participants = getattr(chat_info_obj, "participants", None) or {}
-                    me_id = None
                     me = getattr(client, "me", None)
-                    if me is not None:
-                        contact = getattr(me, "contact", None)
-                        me_id = getattr(contact, "id", None) if contact else None
+                    me_id = getattr(getattr(me, "contact", None), "id", None) if me else None
                     users_map = getattr(client, "users", None) or {}
                     for uid in participants.keys():
                         if me_id is not None and uid == me_id:
                             continue
                         user = users_map.get(uid)
-                        name = getattr(user, "name", None) if user else None
-                        if name:
-                            chat_title = name
+                        candidate = _user_display_name(user)
+                        if candidate:
+                            chat_title = candidate
                             break
-                    # Если это DIALOG и participants пуст (бывает на старте),
-                    # пробуем вычислить собеседника перебором users_map.
-                    if (
-                        not chat_title
-                        and str(getattr(chat_info_obj, "type", "")) == "ChatType.DIALOG"
-                        and me_id is not None
-                    ):
-                        for uid in users_map.keys():
-                            if uid == me_id:
-                                continue
-                            candidate_name = getattr(users_map[uid], "name", None)
-                            if candidate_name:
-                                chat_title = candidate_name
-                                break
                 except Exception as exc:
-                    logger.debug("lookup user for dialog %s failed: %s", chat_id, exc)
+                    logger.debug("lookup participant for chat %s failed: %s", chat_id, exc)
 
             text = message.text or ""
             event: dict[str, Any] = {
