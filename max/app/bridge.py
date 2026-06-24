@@ -26,6 +26,7 @@ from pymax.types.domain.attachments import (
     PhotoAttachment,
     VideoAttachment,
 )
+from pymax.types.domain.enums import ChatType
 
 logger = logging.getLogger(__name__)
 
@@ -298,14 +299,19 @@ def register_bridge(client) -> None:
             #    ``vendor/pymax/api/users/service.py:get_chat_id``) — это
             #    надёжнее перебора ``users_map``, потому что ``client.users``
             #    может быть пуст на старте (sync ещё не прошёл).
+            #
+            #    ВАЖНО: ``ChatType`` — это ``str, Enum``, поэтому сравниваем
+            #    напрямую с ``ChatType.DIALOG`` (даёт True) — ``str(ChatType.DIALOG)``
+            #    возвращает ``"ChatType.DIALOG"``, что ломало предыдущую правку.
             if (
                 not chat_title
                 and chat_info_obj is not None
-                and str(getattr(chat_info_obj, "type", "")) == "DIALOG"
+                and getattr(chat_info_obj, "type", None) == ChatType.DIALOG
             ):
                 try:
                     me = getattr(client, "me", None)
                     me_id = getattr(getattr(me, "contact", None), "id", None) if me else None
+                    users_count = len(getattr(client, "users", None) or {})
                     if me_id is not None:
                         try:
                             peer_id = int(chat_id) ^ int(me_id)
@@ -315,13 +321,14 @@ def register_bridge(client) -> None:
                             users_map = getattr(client, "users", None) or {}
                             user = users_map.get(peer_id)
                             chat_title = _user_display_name(user)
-                            if chat_title:
-                                logger.debug(
-                                    "DIALOG %s: peer_id=%s name=%r",
-                                    chat_id, peer_id, chat_title,
-                                )
+                            logger.info(
+                                "bridge DIALOG path: chat=%s me_id=%s peer_id=%s "
+                                "users_count=%d found=%s title=%r",
+                                chat_id, me_id, peer_id, users_count,
+                                user is not None, chat_title,
+                            )
                 except Exception as exc:
-                    logger.debug("lookup dialog peer for %s failed: %s", chat_id, exc)
+                    logger.info("lookup dialog peer for %s failed: %s", chat_id, exc)
 
             # 4) Fallback для групповых чатов, у которых ``chat.title`` пуст:
             #    берём имя первого участника ≠ self из ``chat.participants``.
