@@ -15,7 +15,7 @@ from aiogram.methods import (
     CreateForumTopic,
     EditForumTopic,
     ExportChatInviteLink,
-    SetChatIsForum,
+    GetChat,
 )
 
 from shared import db as shared_db
@@ -100,18 +100,20 @@ async def get_or_create_topic(
 
 
 async def ensure_forum_enabled(bot: Bot, supergroup_chat_id: int) -> bool:
-    """Включает forum mode в группе, если ещё не включён.
+    """Проверяет, включён ли forum mode в группе.
 
-    Возвращает ``True`` если режим активен (или удалось включить).
-    Bot API 7.0+: ``setChatIsForum``. На старых версиях — no-op.
+    Возвращает ``True`` если уже включён. Если нет — ``False``;
+    пользователю будет предложено включить топики вручную
+    (см. ``handlers.setgroup_command``). Программно включить не пытаемся:
+    метод ``setChatIsForum`` (Bot API 7.0+) в публичном ``aiogram.methods``
+    этой сборки отсутствует, поэтому опираемся только на состояние ``is_forum``.
     """
     try:
-        # Пробуем включить. Telegram вернёт ошибку, если метод недоступен.
-        await bot(SetChatIsForum(chat_id=supergroup_chat_id, is_forum=True))
-        return True
+        chat = await bot(GetChat(chat_id=supergroup_chat_id))
+        return bool(getattr(chat, "is_forum", False))
     except (TelegramAPIError, TelegramRetryAfter) as exc:
         logger.warning(
-            "set_chat_is_forum for %s failed (likely old API): %s",
+            "ensure_forum_enabled: get_chat for %s failed: %s",
             supergroup_chat_id, exc,
         )
         return False
