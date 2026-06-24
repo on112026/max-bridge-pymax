@@ -11,6 +11,12 @@ from typing import Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.methods import (
+    CreateForumTopic,
+    EditForumTopic,
+    ExportChatInviteLink,
+    SetChatIsForum,
+)
 
 from shared import db as shared_db
 
@@ -53,11 +59,11 @@ async def get_or_create_topic(
         desired_name = (chat_title or existing.topic_name or "").strip() or max_chat_id
         if desired_name != existing.topic_name:
             try:
-                await bot.edit_forum_topic(
+                await bot(EditForumTopic(
                     chat_id=supergroup_chat_id,
                     message_thread_id=existing.thread_id,
                     name=_make_topic_display_name(desired_name, max_chat_id),
-                )
+                ))
                 shared_db.update_topic_name(max_chat_id, desired_name)
                 logger.info(
                     "renamed topic for %s → %r", max_chat_id, desired_name
@@ -70,10 +76,10 @@ async def get_or_create_topic(
 
     display_name = _make_topic_display_name(chat_title or "", max_chat_id)
     try:
-        topic = await bot.create_forum_topic(
+        topic = await bot(CreateForumTopic(
             chat_id=supergroup_chat_id,
             name=display_name,
-        )
+        ))
     except (TelegramAPIError, TelegramRetryAfter) as exc:
         logger.warning(
             "create_forum_topic for %s failed: %s", max_chat_id, exc
@@ -101,7 +107,7 @@ async def ensure_forum_enabled(bot: Bot, supergroup_chat_id: int) -> bool:
     """
     try:
         # Пробуем включить. Telegram вернёт ошибку, если метод недоступен.
-        await bot.set_chat_is_forum(chat_id=supergroup_chat_id, is_forum=True)
+        await bot(SetChatIsForum(chat_id=supergroup_chat_id, is_forum=True))
         return True
     except (TelegramAPIError, TelegramRetryAfter) as exc:
         logger.warning(
@@ -114,7 +120,7 @@ async def ensure_forum_enabled(bot: Bot, supergroup_chat_id: int) -> bool:
 async def export_invite_link(bot: Bot, supergroup_chat_id: int) -> Optional[str]:
     """Получить (или пересоздать) ``invite_link`` для приватной группы."""
     try:
-        return await bot.export_chat_invite_link(chat_id=supergroup_chat_id)
+        return await bot(ExportChatInviteLink(chat_id=supergroup_chat_id))
     except (TelegramAPIError, TelegramRetryAfter) as exc:
         logger.warning(
             "export_chat_invite_link for %s failed: %s",
