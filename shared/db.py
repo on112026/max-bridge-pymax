@@ -317,16 +317,45 @@ def _apply_schema_migrations(engine) -> None:
                     continue
                 type_name = _sqlite_type_name(column)
                 nullable = "NULL" if column.nullable else "NOT NULL"
-                # Если колонка NOT NULL без Python-default, ALTER провалится;
-                # в наших моделях таких не должно быть, но на всякий случай
-                # приведём к NULL, чтобы не сломать уже лежащие данные.
-                if not column.nullable and (
-                    column.default is None and column.server_default is None
-                ):
-                    nullable = "NULL"
+                # Для NOT NULL без SQL DEFAULT SQLite не сможет заполнить
+                # существующие строки в ALTER TABLE. Если у колонки есть
+                # Python-side default (например, ``Column(Integer,
+                # nullable=False, default=0)`` — наш случай с
+                # ``chat_topics.stale``), превращаем его в SQL-литерал и
+                # дописываем ``DEFAULT <value>`` — тогда миграция пройдёт
+                # и существующие строки получат это значение.
+                sql_default = ""
+                if not column.nullable and column.server_default is None:
+                    py_default = (
+                        column.default.arg
+                        if column.default is not None else None
+                    )
+                    if py_default is None:
+                        # NOT NULL без default — ослабим до NULL, чтобы
+                        # миграция не уронила старт контейнера.
+                        nullable = "NULL"
+                    elif isinstance(py_default, bool):
+                        sql_default = f" DEFAULT {1 if py_default else 0}"
+                    elif isinstance(py_default, int):
+                        sql_default = f" DEFAULT {int(py_default)}"
+                    elif isinstance(py_default, float):
+                        sql_default = f" DEFAULT {py_default}"
+                    elif isinstance(py_default, str):
+                        escaped = py_default.replace("'", "''")
+                        sql_default = f" DEFAULT '{escaped}'"
+                    else:
+                        # callable / func.* / неизвестный тип — не пытаемся
+                        # угадать, фолбэк на NULL с предупреждением.
+                        logger.warning(
+                            "schema migration: cannot translate Python "
+                            "default %r for %s.%s; falling back to NULL",
+                            py_default, table_name, column.name,
+                        )
+                        nullable = "NULL"
                 ddl = (
                     f"ALTER TABLE {table_name} "
-                    f"ADD COLUMN {column.name} {type_name} {nullable}"
+                    f"ADD COLUMN {column.name} {type_name} "
+                    f"{nullable}{sql_default}"
                 )
                 logger.info("schema migration: %s", ddl)
                 conn.execute(text(ddl))
