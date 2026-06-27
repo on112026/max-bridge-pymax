@@ -1,24 +1,31 @@
-"""Мост PyMax → api: слушаем события MAX, складываем в БД через api.
+"""Мост PyMax → api: колбэки клиента (``on_start`` / ``on_message`` / ``on_chat_update``).
 
-Регистрирует:
-- @client.on_start() — auth_state = ok, fetch chats
-- @client.on_message() — кладём Event в api + (опц.) ChatInfo
-- @client.on_chat_update() — обновляем ChatInfo
+Регистрирует три колбэка на готовом ``Client`` (после ``Client(...)``):
+
+* ``@client.on_start()`` — auth_state = ok, fetch chats.
+* ``@client.on_message()`` — кладём Event в api + (опц.) ChatInfo.
+* ``@client.on_chat_update()`` — обновляем ChatInfo.
+
+Логика ``on_start`` вынесена в ``app.bridge.on_start.on_start_actions``
+(большая часть — sync чатов и дергание ``/internal/sync_topics``).
+
+Логика скачивания медиа — в ``app.bridge.media`` (``process_photo``,
+``process_video``, ``process_file``).
+
+Логика обогащения ``chat.title`` — в ``app.bridge.chats``
+(``enrich_chat_titles``, ``chat_to_dict``, ``display_name_of``).
+
+Имя собеседника для DIALOG — ``app.bridge.users.user_display_name``.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import time
 from datetime import datetime
 from typing import Any, Optional
 
 import httpx
 
-from pymax.files import File as MaxFile
-from pymax.files import Photo as MaxPhoto
-from pymax.files import Video as MaxVideo
 from pymax.types import Chat as MaxChat
 from pymax.types import Message as MaxMessage
 from pymax.types.domain.attachments import (
@@ -28,481 +35,38 @@ from pymax.types.domain.attachments import (
 )
 from pymax.types.domain.enums import ChatType
 
+from app.bridge.chats import chat_to_dict, display_name_of
+from app.bridge.media import process_file, process_photo, process_video
+from app.bridge.on_start import on_start_actions
+from app.bridge.users import user_display_name
+
 logger = logging.getLogger(__name__)
 
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("BRIDGE_API_KEY", "")
-MEDIA_DIR = os.getenv("MEDIA_DIR", "/data/media")
-MAX_MEDIA_DOWNLOAD_BYTES = 49 * 1024 * 1024  # совпадает с TG-лимитом
-
-
-def _headers() -> dict:
-    return {"X-Api-Key": API_KEY}
-
-
-def _user_display_name(user: Any) -> Optional[str]:
-    """Собирает отображаемое имя из ``User.names`` (pymax).
-
-    У ``pymax.User`` нет поля ``name`` — есть ``names: list[Name]``,
-    где каждый ``Name`` содержит ``name`` (полное), ``first_name``,
-    ``last_name`` и ``type`` (см. ``vendor/pymax/types/domain/{user,name}.py``).
-    Возвращает наиболее приоритетный вариант.
-    """
-    if user is None:
-        return None
-    names_list = getattr(user, "names", None) or []
-    # 1) Приоритет — заполненное полное имя.
-    for n in names_list:
-        full = (getattr(n, "name", None) or "").strip()
-        if full:
-            return full
-    # 2) Fallback: склеить first_name + last_name из любой записи.
-    for n in names_list:
-        first = (getattr(n, "first_name", None) or "").strip()
-        last = (getattr(n, "last_name", None) or "").strip()
-        joined = (first + " " + last).strip()
-        if joined:
-            return joined
-    return None
-
-
-def _chat_to_dict(chat: MaxChat) -> dict:
-    return {
-        "max_chat_id": str(chat.id),
-        "title": chat.title or "",
-        "type": str(chat.type) if chat.type else "chat",
-        "last_message_preview": (chat.last_message.text[:200] if chat.last_message and chat.last_message.text else None),
-        "last_message_at": (
-            datetime.utcfromtimestamp(chat.last_event_time / 1000).isoformat()
-            if chat.last_event_time
-            else None
-        ),
-        "unread": chat.new_messages if chat.new_messages is not None else None,
-    }
-
-
-def _display_name_of(chat: Any) -> Optional[str]:
-    """Отдаёт «человеческое» имя чата: ``chat.title`` или обогащённое.
-
-    Обогащение делается в ``_enrich_chat_titles`` (вызывается перед этим
-    в ``_on_start``), где мы подменяем ``chat.title`` на имя собеседника /
-    первого участника для чатов с пустым ``title``. Здесь просто читаем.
-    """
-    title = (getattr(chat, "title", None) or "").strip()
-    return title or None
-
-
-async def _enrich_chat_titles(client: Any, chats: list) -> None:
-    """Обогащает ``chat.title`` для чатов, у которых MAX вернул пустое имя.
-
-    Нужно, чтобы ``TopicSyncWorker`` создал топики сразу с человеческими
-    именами, а не с ``(MAX: <id>)`` или пустой строкой.
-
-    Логика (повторяет ту, что в ``_on_message``, но батчем):
-      * **Системные чаты** (``chat_id == 0`` и т.п.) — фиксированные имена.
-      * **DIALOG**: ``peer_id = chat_id ^ me_id`` → ``client.users[peer_id]``
-        или ``await client.get_user(peer_id)`` → ``_user_display_name``.
-        Если ``peer_id == me_id`` (диалог с самим собой, не 0) — берём
-        собственное имя из ``client.me``.
-      * **CHAT / CHANNEL**: перебираем ``chat.participants`` (исключая self),
-        для каждого берём ``client.users[uid]`` или догружаем через
-        ``client.get_user(uid)``; имя первого непустого становится title.
-      * **Фолбэк**: для любого необогащённого DIALOG/CHAT — ставим
-        ``"MAX чат #<id>"``, чтобы топик в Telegram получил хоть какое-то
-        осмысленное имя (а не пустую строку или ``(MAX: <id>)``).
-    """
-    if not chats:
-        return
-    me = getattr(client, "me", None)
-    me_id = getattr(getattr(me, "contact", None), "id", None) if me else None
-    me_id_int = int(me_id) if me_id is not None else None
-
-    # Хардкод для известных системных чатов MAX. ``0`` — это всегда
-    # «Избранное» (Saved Messages), peer_id = 0 ^ me_id = me_id, и в
-    # ``client.users[me_id]`` лежит какой-то мусор — поэтому лучше отдать
-    # фиксированное русское имя.
-    SYSTEM_NAMES = {
-        0: "Избранное",
-    }
-
-    enriched = 0
-    for chat in chats:
-        try:
-            existing_title = (getattr(chat, "title", None) or "").strip()
-            if existing_title:
-                continue
-            chat_id_raw = getattr(chat, "id", None)
-            if chat_id_raw is None:
-                continue
-            chat_id_int = int(chat_id_raw)
-            chat_type = getattr(chat, "type", None)
-            users_map = getattr(client, "users", None) or {}
-            resolved_name: Optional[str] = None
-            resolved_peer_id: Optional[int] = None
-
-            # 1) Системные чаты с фиксированным именем.
-            if chat_id_int in SYSTEM_NAMES:
-                resolved_name = SYSTEM_NAMES[chat_id_int]
-
-            # 2) DIALOG → peer через XOR, fallback на собственное имя,
-            #    если peer == me_id (диалог с самим собой не через 0).
-            elif chat_type == ChatType.DIALOG and me_id_int is not None:
-                try:
-                    peer_id = chat_id_int ^ me_id_int
-                except (TypeError, ValueError):
-                    peer_id = None
-                if peer_id is not None and peer_id > 0:
-                    user = users_map.get(peer_id)
-                    if user is None and hasattr(client, "get_user"):
-                        try:
-                            fetched = await client.get_user(peer_id)
-                            if fetched is not None:
-                                user = fetched
-                                try:
-                                    users_map[peer_id] = fetched
-                                except Exception:
-                                    pass
-                        except Exception as exc:
-                            logger.info(
-                                "enrich: get_user(%s) failed: %s",
-                                peer_id, exc,
-                            )
-                    if user is not None:
-                        resolved_name = _user_display_name(user)
-                        resolved_peer_id = peer_id
-                # peer_id == 0 или == me_id — «сам с собой» (Saved Messages,
-                # не угадаешь по XOR). Берём собственное имя.
-                if (
-                    not resolved_name
-                    and peer_id is not None
-                    and peer_id == me_id_int
-                ):
-                    me_name = (
-                        _user_display_name(me) if me is not None else None
-                    )
-                    if me_name:
-                        resolved_name = me_name
-                        resolved_peer_id = me_id_int
-
-            # 3) CHAT / CHANNEL: первый участник ≠ self с непустым именем.
-            #    Если participants пуст — оставляем ``resolved_name`` пустым,
-            #    финальный фолбэк ниже сделает ``"MAX чат #<id>"``.
-            else:
-                participants = getattr(chat, "participants", None) or {}
-                for uid in participants.keys():
-                    if me_id_int is not None and uid == me_id_int:
-                        continue
-                    user = users_map.get(uid)
-                    if user is None and hasattr(client, "get_user"):
-                        try:
-                            fetched = await client.get_user(uid)
-                            if fetched is not None:
-                                user = fetched
-                                try:
-                                    users_map[uid] = fetched
-                                except Exception:
-                                    pass
-                        except Exception as exc:
-                            logger.info(
-                                "enrich: get_user(%s) failed: %s", uid, exc,
-                            )
-                            user = None
-                    candidate = _user_display_name(user)
-                    if candidate:
-                        resolved_name = candidate
-                        resolved_peer_id = int(uid)
-                        break
-
-            # 4) Финальный фолбэк: для любого необогащённого чата даём
-            #    честное имя ``"MAX чат #<id>"``. Это лучше, чем пустая
-            #    строка (Telegram-топик не примет пустой name) или
-            #    безликое ``(MAX: <id>)`` без контекста.
-            if not resolved_name:
-                resolved_name = f"MAX чат #{chat_id_int}"
-                logger.info(
-                    "enrich: chat=%s type=%s — fallback to generic name",
-                    chat_id_raw, chat_type,
-                )
-
-            # Подменяем атрибут ``title`` на обогащённое имя. pymax
-            # использует Pydantic v1/v2 — в обоих случаях ``__setattr__``
-            # работает (модель mutable, allow_mutations=True в v1).
-            try:
-                chat.title = resolved_name
-                enriched += 1
-                logger.info(
-                    "enrich: chat=%s type=%s peer=%s → %r",
-                    chat_id_raw, chat_type, resolved_peer_id, resolved_name,
-                )
-            except Exception as exc:
-                logger.info(
-                    "enrich: failed to set title for chat=%s: %s",
-                    chat_id_raw, exc,
-                )
-        except Exception as exc:
-            logger.warning(
-                "enrich: chat=%s failed: %s", getattr(chat, "id", "?"), exc,
-            )
-    if enriched:
-        logger.info("enrich: обогатили %d/%d чатов именами", enriched, len(chats))
-
-
-async def _post(path: str, json: dict | None = None) -> None:
+async def _post(path: str, json: dict = None) -> None:
+    """Best-effort POST в API (без проверки ответа)."""
+    import os
+    api_base = os.getenv("API_BASE_URL", "http://localhost:8000")
+    api_key = os.getenv("BRIDGE_API_KEY", "")
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=30.0) as c:
-            r = await c.post(path, json=json, headers=_headers())
+        async with httpx.AsyncClient(base_url=api_base, timeout=30.0) as c:
+            r = await c.post(path, json=json or {}, headers={"X-Api-Key": api_key})
             r.raise_for_status()
     except Exception as exc:
         logger.warning("api POST %s failed: %s", path, exc)
 
 
-async def _download_to_file(url: str, dest_path: str) -> int:
-    """Скачивает файл по url в dest_path. Возвращает размер в байтах."""
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as c:
-        async with c.stream("GET", url) as r:
-            r.raise_for_status()
-            written = 0
-            with open(dest_path, "wb") as f:
-                async for chunk in r.aiter_bytes(64 * 1024):
-                    f.write(chunk)
-                    written += len(chunk)
-                    if written > MAX_MEDIA_DOWNLOAD_BYTES:
-                        # Слишком большой — обрезаем, чтобы TG смог переслать
-                        logger.warning("file too large, truncated at %d bytes", written)
-                        break
-            return written
-
-
-def _media_subdir(kind: str) -> str:
-    return os.path.join(MEDIA_DIR, "inbox", kind)
-
-
-def _safe_filename(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in (name or "file"))[:120]
-
-
-async def _process_photo(att: PhotoAttachment, chat_id: str, msg_id: str) -> Optional[dict]:
-    """Скачивает фото (если не превью) и возвращает media dict для EventIn."""
-    # У PhotoAttachment уже есть base_url + photo_token
-    url = f"{att.base_url.rstrip('/')}/{att.photo_token}"
-    fname = _safe_filename(f"{chat_id}_{msg_id}_{att.photo_id}.jpg")
-    rel = f"inbox/photo/{fname}"
-    abs_path = os.path.join(MEDIA_DIR, rel)
-    try:
-        size = await _download_to_file(url, abs_path)
-    except Exception as exc:
-        logger.warning("photo download failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
-        return None
-    return {
-        "kind": "photo",
-        "media_path": rel,
-        "media_mime": "image/jpeg",
-        "media_filename": fname,
-        "media_size": size,
-    }
-
-
-async def _process_video(att: VideoAttachment, client, chat_id: int, msg_id: str) -> Optional[dict]:
-    """Скачивает видео через client.get_video_by_id."""
-    try:
-        vreq = await client.get_video_by_id(chat_id, msg_id, att.video_id)
-    except Exception as exc:
-        logger.warning("get_video_by_id failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
-        return None
-    if not vreq or not getattr(vreq, "url", None):
-        logger.info("video url missing chat=%s msg=%s", chat_id, msg_id)
-        return None
-    url = vreq.url
-    ext = "mp4"
-    fname = _safe_filename(f"{chat_id}_{msg_id}_{att.video_id}.{ext}")
-    rel = f"inbox/video/{fname}"
-    abs_path = os.path.join(MEDIA_DIR, rel)
-    try:
-        size = await _download_to_file(url, abs_path)
-    except Exception as exc:
-        logger.warning("video download failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
-        return None
-    return {
-        "kind": "video",
-        "media_path": rel,
-        "media_mime": "video/mp4",
-        "media_filename": fname,
-        "media_size": size,
-    }
-
-
-async def _process_file(att: FileAttachment, client, chat_id: int, msg_id: str) -> Optional[dict]:
-    """Скачивает файл через client.get_file_by_id."""
-    try:
-        freq = await client.get_file_by_id(chat_id, msg_id, att.file_id)
-    except Exception as exc:
-        logger.warning("get_file_by_id failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
-        return None
-    if not freq or not getattr(freq, "url", None):
-        logger.info("file url missing chat=%s msg=%s", chat_id, msg_id)
-        return None
-    url = freq.url
-    fname = _safe_filename(att.name or f"file_{att.file_id}")
-    rel = f"inbox/file/{fname}"
-    abs_path = os.path.join(MEDIA_DIR, rel)
-    try:
-        size = await _download_to_file(url, abs_path)
-    except Exception as exc:
-        logger.warning("file download failed chat=%s msg=%s: %s", chat_id, msg_id, exc)
-        return None
-    return {
-        "kind": "document",
-        "media_path": rel,
-        "media_mime": None,
-        "media_filename": fname,
-        "media_size": size,
-    }
-
-
 def register_bridge(client) -> None:
-    """Регистрирует обработчики на готовом client (после Client(...))."""
+    """Зарегистрировать обработчики на готовом client (после ``Client(...)``)."""
 
     @client.on_start()
     async def _on_start(client) -> None:
-        logger.info("PyMax client started, marking auth=ok")
-        # ВАЖНО: передаём ``clear_error=True``, чтобы прошлая ошибка
-        # (например, ``error.limit.violate`` от прошлой неудачной попытки)
-        # не висела в /status после успешной авторизации. Без этого
-        # AuthWatcher в боте не увидит переход need_2fa → ok и не пришлёт
-        # сообщение «✅ MAX: вход выполнен успешно».
-        try:
-            async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as c:
-                r = await c.post(
-                    "/auth/state",
-                    json={
-                        "status": "ok",
-                        "last_login": True,
-                        "clear_error": True,
-                    },
-                    headers=_headers(),
-                )
-                r.raise_for_status()
-        except Exception as exc:
-            logger.warning("on_start: post auth_state ok failed: %s", exc)
-
-        # Синхронизируем список чатов MAX с БД. Без этого /chats в боте
-        # показывает пустой список, потому что @on_chat_update срабатывает
-        # только при активности в чате (новое сообщение, переименование и
-        # т.п.), а на старте MAX может не отправить ни одного события.
-        #
-        # Используем ``client.fetch_chats(marker=None)`` — это гарантированный
-        # способ получить полный список чатов пользователя с сервера MAX
-        # (Opcode.CHATS_LIST) с пагинацией по marker (мс). ``client.chats``
-        # (кеш) может быть пустым на свежей сессии, поэтому опираемся именно
-        # на серверный ответ.
-        chats_list: list = []
-        try:
-            if hasattr(client, "fetch_chats"):
-                try:
-                    chats_list = await client.fetch_chats(marker=None) or []
-                except TypeError:
-                    # Сигнатура без kwargs в каких-то форках pymax.
-                    chats_list = await client.fetch_chats() or []
-                logger.info("fetch_chats on start returned %d chats", len(chats_list))
-            else:
-                logger.warning(
-                    "on_start: client.fetch_chats not available; "
-                    "falling back to client.chats cache"
-                )
-                chats_list = list(getattr(client, "chats", None) or [])
-        except Exception as exc:
-            logger.warning("on_start: fetch_chats failed: %s", exc)
-            chats_list = list(getattr(client, "chats", None) or [])
-
-        # Если первый fetch вернул пустой список (например, MAX ещё не успел
-        # прогреть кеш после login/sync) — пробуем ещё раз через 5 секунд,
-        # один раз. Без этого на свежей сессии можно получить «0 чатов»
-        # и не создать ни одного топика.
-        if not chats_list and hasattr(client, "fetch_chats"):
-            try:
-                import asyncio as _asyncio
-                await _asyncio.sleep(5.0)
-                try:
-                    chats_list = await client.fetch_chats(marker=None) or []
-                except TypeError:
-                    chats_list = await client.fetch_chats() or []
-                logger.info(
-                    "fetch_chats retry on start returned %d chats", len(chats_list),
-                )
-            except Exception as exc:
-                logger.warning("on_start: fetch_chats retry failed: %s", exc)
-
-        # 0) Обогащаем ``title`` для чатов, у которых MAX его не вернул.
-        # Это особенно важно для личных диалогов (DIALOG): MAX кладёт
-        # имя собеседника не в ``chat.title``, а в ``client.users[user_id].
-        # names``. Сразу после login ``client.users`` может быть пуст — тогда
-        # без обогащения в Telegram-группе создаются топики ``(MAX: <id>)``
-        # или вообще пустые. Логика та же, что и в ``_on_message``: для
-        # DIALOG тянем peer-юзера через XOR ``me_id ^ chat_id``, для
-        # групповых чатов без title — имя первого участника.
-        await _enrich_chat_titles(client, chats_list)
-
-        # 1) Поэлементно синхронизируем каждую запись чата в БД (источник
-        # истины для ``chats`` используется ``/chats``-эндпоинтом).
-        if chats_list:
-            synced = 0
-            for chat in chats_list:
-                try:
-                    await _post("/chats", _chat_to_dict(chat))
-                    synced += 1
-                except Exception as exc:
-                    logger.warning(
-                        "chat upsert on start failed for %s: %s",
-                        getattr(chat, "id", "?"), exc,
-                    )
-            logger.info("synced %d chats on start", synced)
-
-            # 2) Дёргаем новый ``/internal/sync_topics``: API сравнит свежий
-            # список MAX с уже существующими ``ChatTopic``, пометит пропавшие
-            # как ``stale=1`` и поставит в очередь ``create``/``rename``-джобы
-        # для бота (``TopicSyncWorker`` их потом подхватит и создаст топики
-        # в Telegram-группе через createForumTopic / editForumTopic).
-        try:
-            sync_payload = {
-                "trigger": "auth_ok",
-                "chats": [
-                    {
-                        "max_chat_id": str(getattr(c, "id", "")),
-                        "title": _display_name_of(c) or "",
-                        "type": str(getattr(c, "type", "") or ""),
-                    }
-                    for c in chats_list
-                    if getattr(c, "id", None) is not None
-                ],
-            }
-            async with httpx.AsyncClient(
-                base_url=API_BASE, timeout=15.0
-            ) as _c:
-                _r = await _c.post(
-                    "/internal/sync_topics",
-                    json=sync_payload,
-                    headers=_headers(),
-                )
-                if _r.status_code >= 400:
-                    logger.warning(
-                        "on_start: /internal/sync_topics returned %s: %s",
-                        _r.status_code, _r.text[:200],
-                    )
-                else:
-                    body = _r.json() if _r.content else {}
-                    logger.info(
-                        "on_start: sync_topics result: %s",
-                        body,
-                    )
-        except Exception as exc:
-            logger.warning("on_start: post /internal/sync_topics failed: %s", exc)
+        await on_start_actions(client)
 
     @client.on_chat_update()
     async def _on_chat_update(chat: MaxChat) -> None:
         try:
-            await _post("/chats", _chat_to_dict(chat))
+            await _post("/chats", chat_to_dict(chat))
         except Exception as exc:
             logger.warning("chat update failed: %s", exc)
 
@@ -546,10 +110,6 @@ def register_bridge(client) -> None:
             #    ``vendor/pymax/api/users/service.py:get_chat_id``) — это
             #    надёжнее перебора ``users_map``, потому что ``client.users``
             #    может быть пуст на старте (sync ещё не прошёл).
-            #
-            #    ВАЖНО: ``ChatType`` — это ``str, Enum``, поэтому сравниваем
-            #    напрямую с ``ChatType.DIALOG`` (даёт True) — ``str(ChatType.DIALOG)``
-            #    возвращает ``"ChatType.DIALOG"``, что ломало предыдущую правку.
             if (
                 not chat_title
                 and chat_info_obj is not None
@@ -568,10 +128,6 @@ def register_bridge(client) -> None:
                             users_map = getattr(client, "users", None) or {}
                             user = users_map.get(peer_id)
                             found_after_fetch = user is not None
-                            # Если peer'а нет в кеше — догружаем с сервера.
-                            # ``client.get_user`` есть в pymax (см.
-                            # ``vendor/pymax/infra/user.py:33``) и сам кладёт
-                            # результат в ``client.users[peer_id]``.
                             if user is None and hasattr(client, "get_user"):
                                 try:
                                     fetched = await client.get_user(peer_id)
@@ -586,7 +142,7 @@ def register_bridge(client) -> None:
                                     logger.info(
                                         "get_user(%s) failed: %s", peer_id, exc,
                                     )
-                            chat_title = _user_display_name(user)
+                            chat_title = user_display_name(user)
                             logger.info(
                                 "bridge DIALOG path: chat=%s me_id=%s peer_id=%s "
                                 "users_count=%d found=%s found_after_fetch=%s title=%r",
@@ -608,7 +164,7 @@ def register_bridge(client) -> None:
                         if me_id is not None and uid == me_id:
                             continue
                         user = users_map.get(uid)
-                        candidate = _user_display_name(user)
+                        candidate = user_display_name(user)
                         if candidate:
                             chat_title = candidate
                             break
@@ -633,22 +189,21 @@ def register_bridge(client) -> None:
             # Обработка вложений
             for att in message.attaches or []:
                 if isinstance(att, PhotoAttachment):
-                    media = await _process_photo(att, chat_id, msg_id)
+                    media = await process_photo(att, chat_id, msg_id)
                     if media:
                         event.update(media)
                         break  # одно фото на событие (TG send_photo принимает 1)
                 elif isinstance(att, VideoAttachment):
-                    media = await _process_video(att, client, int(chat_id), msg_id)
+                    media = await process_video(att, client, int(chat_id), msg_id)
                     if media:
                         event.update(media)
                         break
                 elif isinstance(att, FileAttachment):
-                    media = await _process_file(att, client, int(chat_id), msg_id)
+                    media = await process_file(att, client, int(chat_id), msg_id)
                     if media:
                         event.update(media)
                         break
                 else:
-                    # voice/audio/sticker/control/share/contact — пропускаем
                     logger.debug("skip attachment type=%s", getattr(att, "type", "?"))
 
             await _post("/events", event)
