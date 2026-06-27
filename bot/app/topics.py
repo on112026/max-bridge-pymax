@@ -12,6 +12,7 @@ from typing import Optional
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.methods import (
+    CloseForumTopic,
     CreateForumTopic,
     EditForumTopic,
     ExportChatInviteLink,
@@ -129,3 +130,66 @@ async def export_invite_link(bot: Bot, supergroup_chat_id: int) -> Optional[str]
             supergroup_chat_id, exc,
         )
         return None
+
+
+async def rename_topic(
+    bot: Bot,
+    supergroup_chat_id: int,
+    thread_id: int,
+    max_chat_id: str,
+    new_chat_title: Optional[str],
+) -> bool:
+    """Переименовать существующий топик и обновить ``ChatTopic.topic_name``.
+
+    Используется из ``TopicSyncWorker`` при ``action="rename"``.
+
+    Возвращает ``True`` при успехе. На любой Telegram-ошибке возвращает
+    ``False`` и не обновляет БД, чтобы воркер мог пометить джоб failed.
+    """
+    new_title = (new_chat_title or "").strip()
+    display_name = _make_topic_display_name(new_title, max_chat_id)
+    try:
+        await bot(EditForumTopic(
+            chat_id=supergroup_chat_id,
+            message_thread_id=thread_id,
+            name=display_name,
+        ))
+    except (TelegramAPIError, TelegramRetryAfter) as exc:
+        logger.warning(
+            "rename_topic for %s thread=%s failed: %s",
+            max_chat_id, thread_id, exc,
+        )
+        return False
+    shared_db.update_topic_name(max_chat_id, new_title)
+    logger.info(
+        "renamed topic for %s → %r (thread=%s)",
+        max_chat_id, new_title, thread_id,
+    )
+    return True
+
+
+async def close_topic(
+    bot: Bot,
+    supergroup_chat_id: int,
+    thread_id: int,
+) -> bool:
+    """Закрыть топик в Telegram через ``closeForumTopic``.
+
+    Используется из ``/prune_topics``. Сам по себе метод только
+    закрывает топик (но не удаляет — Telegram Bot API этого не умеет;
+    пользователь может потом переоткрыть вручную). Пометку ``stale=2``
+    в БД делает вызывающий код через ``api.close_stale_topic``.
+    """
+    try:
+        await bot(CloseForumTopic(
+            chat_id=supergroup_chat_id,
+            message_thread_id=thread_id,
+        ))
+    except (TelegramAPIError, TelegramRetryAfter) as exc:
+        logger.warning(
+            "close_topic for thread=%s failed: %s",
+            thread_id, exc,
+        )
+        return False
+    logger.info("closed topic thread=%s in supergroup=%s", thread_id, supergroup_chat_id)
+    return True

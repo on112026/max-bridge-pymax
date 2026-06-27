@@ -225,32 +225,103 @@ def register_bridge(client) -> None:
         # показывает пустой список, потому что @on_chat_update срабатывает
         # только при активности в чате (новое сообщение, переименование и
         # т.п.), а на старте MAX может не отправить ни одного события.
+        #
+        # Используем ``client.fetch_chats(marker=None)`` — это гарантированный
+        # способ получить полный список чатов пользователя с сервера MAX
+        # (Opcode.CHATS_LIST) с пагинацией по marker (мс). ``client.chats``
+        # (кеш) может быть пустым на свежей сессии, поэтому опираемся именно
+        # на серверный ответ.
+        chats_list: list = []
         try:
-            chats_attr = getattr(client, "chats", None)
-            if chats_attr is None and hasattr(client, "get_chats"):
-                chats_attr = client.get_chats
-            chats_list: Optional[list] = None
-            if callable(chats_attr):
+            if hasattr(client, "fetch_chats"):
                 try:
-                    chats_list = await chats_attr()
+                    chats_list = await client.fetch_chats(marker=None) or []
                 except TypeError:
-                    chats_list = chats_attr()
-            elif chats_attr is not None:
-                chats_list = chats_attr
-            if chats_list:
-                synced = 0
-                for chat in chats_list:
-                    try:
-                        await _post("/chats", _chat_to_dict(chat))
-                        synced += 1
-                    except Exception as exc:
-                        logger.warning(
-                            "chat upsert on start failed for %s: %s",
-                            getattr(chat, "id", "?"), exc,
-                        )
-                logger.info("synced %d chats on start", synced)
+                    # Сигнатура без kwargs в каких-то форках pymax.
+                    chats_list = await client.fetch_chats() or []
+                logger.info("fetch_chats on start returned %d chats", len(chats_list))
+            else:
+                logger.warning(
+                    "on_start: client.fetch_chats not available; "
+                    "falling back to client.chats cache"
+                )
+                chats_list = list(getattr(client, "chats", None) or [])
         except Exception as exc:
-            logger.warning("on_start: fetch chats failed: %s", exc)
+            logger.warning("on_start: fetch_chats failed: %s", exc)
+            chats_list = list(getattr(client, "chats", None) or [])
+
+        # Если первый fetch вернул пустой список (например, MAX ещё не успел
+        # прогреть кеш после login/sync) — пробуем ещё раз через 5 секунд,
+        # один раз. Без этого на свежей сессии можно получить «0 чатов»
+        # и не создать ни одного топика.
+        if not chats_list and hasattr(client, "fetch_chats"):
+            try:
+                import asyncio as _asyncio
+                await _asyncio.sleep(5.0)
+                try:
+                    chats_list = await client.fetch_chats(marker=None) or []
+                except TypeError:
+                    chats_list = await client.fetch_chats() or []
+                logger.info(
+                    "fetch_chats retry on start returned %d chats", len(chats_list),
+                )
+            except Exception as exc:
+                logger.warning("on_start: fetch_chats retry failed: %s", exc)
+
+        # 1) Поэлементно синхронизируем каждую запись чата в БД (источник
+        # истины для ``chats`` используется ``/chats``-эндпоинтом).
+        if chats_list:
+            synced = 0
+            for chat in chats_list:
+                try:
+                    await _post("/chats", _chat_to_dict(chat))
+                    synced += 1
+                except Exception as exc:
+                    logger.warning(
+                        "chat upsert on start failed for %s: %s",
+                        getattr(chat, "id", "?"), exc,
+                    )
+            logger.info("synced %d chats on start", synced)
+
+            # 2) Дёргаем новый ``/internal/sync_topics``: API сравнит свежий
+            # список MAX с уже существующими ``ChatTopic``, пометит пропавшие
+            # как ``stale=1`` и поставит в очередь ``create``/``rename``-джобы
+        # для бота (``TopicSyncWorker`` их потом подхватит и создаст топики
+        # в Telegram-группе через createForumTopic / editForumTopic).
+        try:
+            sync_payload = {
+                "trigger": "auth_ok",
+                "chats": [
+                    {
+                        "max_chat_id": str(getattr(c, "id", "")),
+                        "title": getattr(c, "title", None) or "",
+                        "type": str(getattr(c, "type", "") or ""),
+                    }
+                    for c in chats_list
+                    if getattr(c, "id", None) is not None
+                ],
+            }
+            async with httpx.AsyncClient(
+                base_url=API_BASE, timeout=15.0
+            ) as _c:
+                _r = await _c.post(
+                    "/internal/sync_topics",
+                    json=sync_payload,
+                    headers=_headers(),
+                )
+                if _r.status_code >= 400:
+                    logger.warning(
+                        "on_start: /internal/sync_topics returned %s: %s",
+                        _r.status_code, _r.text[:200],
+                    )
+                else:
+                    body = _r.json() if _r.content else {}
+                    logger.info(
+                        "on_start: sync_topics result: %s",
+                        body,
+                    )
+        except Exception as exc:
+            logger.warning("on_start: post /internal/sync_topics failed: %s", exc)
 
     @client.on_chat_update()
     async def _on_chat_update(chat: MaxChat) -> None:

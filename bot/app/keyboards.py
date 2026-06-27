@@ -29,6 +29,18 @@ class SessionUseCallback(CallbackData, prefix="session_use"):
     session_name: str
 
 
+class PruneTopicCallback(CallbackData, prefix="prune_topic"):
+    """Callback-фабрика для ``/prune_topics``.
+
+    ``action``:
+      * ``"close"`` — закрыть один конкретный топик (``max_chat_id``).
+      * ``"close_all"`` — закрыть все stale-топики владельца.
+    """
+
+    action: str  # "close" | "close_all"
+    max_chat_id: str = ""
+
+
 def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
     return types.ReplyKeyboardMarkup(
         keyboard=[

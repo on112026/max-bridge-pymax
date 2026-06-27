@@ -197,6 +197,14 @@ class ChatTopic(Base):
     Каждый уникальный ``max_chat_id`` получает свой топик внутри
     supergroup. Топики создаются автоматически при первом входящем
     сообщении из MAX (``forwarder.py::get_or_create_topic``).
+
+    ``stale`` — флаг «MAX-чат пропал»:
+      * ``0`` — живой чат, топик актуален (по умолчанию).
+      * ``1`` — MAX-чат не найден в свежем sync (``fetch_chats``),
+        но топик в Telegram ещё открыт. Показываем в ``/status`` и
+        предлагаем ``/prune_topics``.
+      * ``2`` — владелец явно закрыл топик (``closeForumTopic``)
+        или пометил его как устаревший; больше не показываем.
     """
 
     __tablename__ = "chat_topics"
@@ -208,6 +216,35 @@ class ChatTopic(Base):
     # который мы добавляем при создании топика.
     topic_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Признак «MAX-чат пропал». 0 — живой, 1 — stale, 2 — закрыт.
+    stale = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TopicSyncJob(Base):
+    """Очередь задач на создание/переименование топика в Telegram.
+
+    Max-процесс (в ``_on_start``) при auth=ok заливает сюда пачку
+    задач через ``POST /internal/sync_topics``. Bot-процесс (TopicSyncWorker)
+    раз в 2 секунды забирает pending-джобы и через ``createForumTopic`` /
+    ``editForumTopic`` создаёт/переименовывает топики, помечая джоб done/failed.
+    """
+
+    __tablename__ = "topic_sync_jobs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id = Column(Integer, index=True, nullable=False)
+    max_chat_id = Column(String, index=True, nullable=False)
+    chat_title = Column(String, nullable=True)
+    # "create" | "rename" — что именно должен сделать бот.
+    action = Column(String, nullable=False)
+    # "pending" | "in_progress" | "done" | "failed".
+    status = Column(String, nullable=False, default="pending")
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    # Количество попыток (для backoff в worker'е).
+    attempts = Column(Integer, nullable=False, default=0)
 
 
 # Маппинг SQLAlchemy-типов на компактные имена SQLite-типов, которые мы
@@ -954,3 +991,285 @@ def list_topics() -> List[ChatTopic]:
         )
         s.expunge_all()
         return list(rows)
+
+
+def mark_topics_stale(missing_max_chat_ids: List[str]) -> int:
+    """Пометить ``stale=1`` для всех топиков, чей ``max_chat_id`` отсутствует
+    в свежем sync из MAX.
+
+    Идемпотентно: топики, которые уже ``stale=2`` (закрыты вручную), НЕ
+    трогаем — иначе после закрытия они снова всплывут как «stale».
+
+    Возвращает количество помеченных строк.
+    """
+    if not missing_max_chat_ids:
+        return 0
+    from sqlalchemy import update
+
+    with session_scope() as s:
+        result = s.execute(
+            update(ChatTopic)
+            .where(
+                ChatTopic.max_chat_id.in_([str(c) for c in missing_max_chat_ids]),
+                ChatTopic.stale == 0,
+            )
+            .values(stale=1, updated_at=datetime.utcnow())
+        )
+        return int(result.rowcount or 0)
+
+
+def unmark_topic_stale(max_chat_id: str) -> None:
+    """Сбросить ``stale=0`` (MAX-чат снова появился в sync)."""
+    with session_scope() as s:
+        row = (
+            s.query(ChatTopic)
+            .filter(ChatTopic.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if row and row.stale != 0:
+            row.stale = 0
+            row.updated_at = datetime.utcnow()
+
+
+def list_stale_topics(owner_user_id: int) -> List[ChatTopic]:
+    """Stale-топики (``stale=1``) для конкретного владельца.
+
+    Используется командой ``/prune_topics``: показываем владельцу список
+    топиков, у которых MAX-чат пропал, чтобы он решил — закрыть или оставить.
+    """
+    with session_scope() as s:
+        sg = (
+            s.query(SuperGroup)
+            .filter(SuperGroup.owner_user_id == int(owner_user_id))
+            .first()
+        )
+        if not sg:
+            return []
+        rows = (
+            s.query(ChatTopic)
+            .filter(
+                ChatTopic.supergroup_chat_id == int(sg.supergroup_chat_id),
+                ChatTopic.stale == 1,
+            )
+            .order_by(ChatTopic.created_at.asc())
+            .all()
+        )
+        s.expunge_all()
+        return list(rows)
+
+
+def mark_topic_closed(max_chat_id: str) -> None:
+    """Пометить топик как закрытый владельцем (``stale=2``).
+
+    Используется из ``/prune_topics`` после успешного ``closeForumTopic``,
+    чтобы при следующем sync не предлагать его снова как «stale».
+    """
+    with session_scope() as s:
+        row = (
+            s.query(ChatTopic)
+            .filter(ChatTopic.max_chat_id == str(max_chat_id))
+            .first()
+        )
+        if row:
+            row.stale = 2
+            row.updated_at = datetime.utcnow()
+
+
+def count_stale_topics() -> int:
+    """Общее количество stale-топиков (``stale=1``) по всем владельцам.
+    Показываем в ``/status`` как предупреждение."""
+    with session_scope() as s:
+        return int(
+            s.query(ChatTopic).filter(ChatTopic.stale == 1).count() or 0
+        )
+
+
+def count_topics_for_owner(owner_user_id: int) -> int:
+    """Количество stale-топиков у конкретного владельца (для status)."""
+    with session_scope() as s:
+        sg = (
+            s.query(SuperGroup)
+            .filter(SuperGroup.owner_user_id == int(owner_user_id))
+            .first()
+        )
+        if not sg:
+            return 0
+        return int(
+            s.query(ChatTopic)
+            .filter(
+                ChatTopic.supergroup_chat_id == int(sg.supergroup_chat_id),
+                ChatTopic.stale == 1,
+            )
+            .count()
+            or 0
+        )
+
+
+# --- Очередь задач синхронизации топиков (TopicSyncJob) ---
+
+
+def enqueue_topic_sync_jobs(
+    owner_user_id: int,
+    chats: List[dict],
+    supergroup_chat_id: int,
+) -> List[int]:
+    """Положить пачку задач ``create``/``rename`` в ``topic_sync_jobs``.
+
+    ``chats`` — список ``{max_chat_id, title}``. Для каждого:
+      * если топика ещё нет в ``chat_topics`` → ``action="create"``;
+      * если топик есть и ``title`` поменялся → ``action="rename"``.
+
+    Возвращает список id созданных джобов. Если у владельца ещё нет
+    supergroup (``supergroup_chat_id is None``) — возвращает ``[]``.
+
+    Дубль по ``(owner_user_id, max_chat_id, action, status='pending')``
+    игнорируется: если для того же чата уже висит pending-джоб,
+    новый не создаём.
+    """
+    if not chats or not supergroup_chat_id:
+        return []
+    out: List[int] = []
+    with session_scope() as s:
+        existing_topics = {
+            t.max_chat_id: t
+            for t in s.query(ChatTopic).filter(
+                ChatTopic.supergroup_chat_id == int(supergroup_chat_id)
+            ).all()
+        }
+        # Уже висящие pending-джобы — чтобы не плодить дубли.
+        existing_jobs = set(
+            (j.owner_user_id, j.max_chat_id, j.action)
+            for j in s.query(TopicSyncJob).filter(
+                TopicSyncJob.status.in_(("pending", "in_progress"))
+            ).all()
+        )
+        for chat in chats:
+            cid = str(chat.get("max_chat_id") or "")
+            if not cid:
+                continue
+            title = (chat.get("title") or "").strip() or None
+            existing_topic = existing_topics.get(cid)
+            if existing_topic is None:
+                action = "create"
+            else:
+                # Сравниваем сохранённое имя с новым (с trim'ом).
+                old = (existing_topic.topic_name or "").strip()
+                new = (title or "").strip()
+                if old == new:
+                    # Заодно сбрасываем stale, если был.
+                    if existing_topic.stale == 1:
+                        existing_topic.stale = 0
+                        existing_topic.updated_at = datetime.utcnow()
+                    continue
+                action = "rename"
+            key = (int(owner_user_id), cid, action)
+            if key in existing_jobs:
+                continue
+            s.add(TopicSyncJob(
+                owner_user_id=int(owner_user_id),
+                max_chat_id=cid,
+                chat_title=title,
+                action=action,
+                status="pending",
+            ))
+            existing_jobs.add(key)
+            s.flush()
+            out.append(int(s.query(TopicSyncJob).filter(
+                TopicSyncJob.owner_user_id == int(owner_user_id),
+                TopicSyncJob.max_chat_id == cid,
+                TopicSyncJob.action == action,
+                TopicSyncJob.status == "pending",
+            ).order_by(TopicSyncJob.id.desc()).first().id))
+    return out
+
+
+def claim_pending_topic_jobs(limit: int = 5) -> List[TopicSyncJob]:
+    """Атомарно забрать ``limit`` pending-джобов и пометить ``in_progress``.
+
+    Увеличивает ``attempts``. Используется бот-воркером.
+    """
+    from sqlalchemy import update
+
+    with session_scope() as s:
+        rows = (
+            s.execute(
+                select(TopicSyncJob)
+                .where(TopicSyncJob.status == "pending")
+                .order_by(TopicSyncJob.created_at.asc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return []
+        ids = [int(r.id) for r in rows]
+        s.execute(
+            update(TopicSyncJob)
+            .where(TopicSyncJob.id.in_(ids))
+            .values(
+                status="in_progress",
+                started_at=datetime.utcnow(),
+                attempts=TopicSyncJob.attempts + 1,
+            )
+        )
+        # Перечитываем, чтобы вернуть уже-обновлённые копии.
+        rows = (
+            s.execute(
+                select(TopicSyncJob)
+                .where(TopicSyncJob.id.in_(ids))
+                .order_by(TopicSyncJob.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+        s.expunge_all()
+        return list(rows)
+
+
+def finish_topic_sync_job(
+    job_id: int,
+    ok: bool,
+    error: Optional[str] = None,
+) -> None:
+    """Пометить джоб ``done``/``failed``."""
+    with session_scope() as s:
+        row = s.get(TopicSyncJob, job_id)
+        if not row:
+            return
+        row.status = "done" if ok else "failed"
+        row.error = error
+        row.finished_at = datetime.utcnow()
+
+
+def count_pending_topic_jobs() -> int:
+    """Сколько задач ещё ждёт в очереди (для /status)."""
+    with session_scope() as s:
+        return int(
+            s.query(TopicSyncJob)
+            .filter(TopicSyncJob.status.in_(("pending", "in_progress")))
+            .count()
+            or 0
+        )
+
+
+def get_topic_sync_stats() -> dict:
+    """Статистика по очереди задач на синк топиков."""
+    with session_scope() as s:
+        rows = (
+            s.query(
+                TopicSyncJob.status, TopicSyncJob.action
+            ).all()
+        )
+        from collections import Counter
+        c = Counter((r.status, r.action) for r in rows)
+        return {
+            "pending_create": c.get(("pending", "create"), 0),
+            "pending_rename": c.get(("pending", "rename"), 0),
+            "in_progress_create": c.get(("in_progress", "create"), 0),
+            "in_progress_rename": c.get(("in_progress", "rename"), 0),
+            "done_create": c.get(("done", "create"), 0),
+            "done_rename": c.get(("done", "rename"), 0),
+            "failed_create": c.get(("failed", "create"), 0),
+            "failed_rename": c.get(("failed", "rename"), 0),
+        }

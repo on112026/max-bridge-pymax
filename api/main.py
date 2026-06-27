@@ -746,6 +746,284 @@ async def post_session_use(body: SessionUseIn) -> OkOut:
         raise HTTPException(status_code=500, detail=f"Failed to use session: {exc}")
 
 
+# ---------- Sync чатов MAX → топики Telegram (при auth=ok) ----------
+
+
+class SyncTopicChat(BaseModel):
+    """Один чат из MAX в payload ``/internal/sync_topics``."""
+
+    max_chat_id: str
+    title: Optional[str] = None
+    type: Optional[str] = None
+
+
+class SyncTopicsIn(BaseModel):
+    """Запрос от max-процесса после ``fetch_chats``.
+
+    ``trigger`` — текстовая метка (``"auth_ok"`` / ``"manual"`` / …),
+    сейчас только логируется. ``chats`` — полный список чатов из MAX
+    на момент sync'а.
+    """
+
+    trigger: Optional[str] = None
+    chats: List[SyncTopicChat]
+
+
+class SyncTopicsOut(BaseModel):
+    ok: bool = True
+    trigger: Optional[str] = None
+    synced_chats: int = 0
+    enqueued_jobs: int = 0
+    by_action: dict = {}
+    stale_topics: int = 0
+
+
+@app.post(
+    "/internal/sync_topics",
+    response_model=SyncTopicsOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def internal_sync_topics(body: SyncTopicsIn) -> SyncTopicsOut:
+    """max-процесс вызывает после успешного ``fetch_chats()``.
+
+    Логика:
+      1. Сравнить ``body.chats`` с уже существующими ``ChatTopic`` по всем
+         владельцам. Топики, чей ``max_chat_id`` НЕТ в свежем sync, пометить
+         ``stale=1`` (MAX-чат пропал).
+      2. Для каждой записи в ``super_groups`` (по каждому владельцу) —
+         сматчить свежий список чатов с уже существующими топиками:
+           * новый ``max_chat_id`` → джоб ``action="create"``;
+           * ``title`` поменялся → джоб ``action="rename"``;
+           * совпало — ничего не делаем, заодно сбрасываем stale=0.
+      3. Возвращаем счётчики для логов max-процесса.
+
+    Если владелец ещё не сделал ``/setgroup`` (``super_groups`` пуст) —
+    возвращаем ``enqueued_jobs=0``, чаты просто сохранятся в ``chats``
+    (это сделал эндпоинт ``POST /chats`` раньше в bridge.py).
+    """
+    trigger = (body.trigger or "").strip() or None
+    chats = body.chats or []
+    incoming_ids: set[str] = set()
+    incoming_by_id: dict[str, dict] = {}
+    for ch in chats:
+        cid = str(ch.max_chat_id or "").strip()
+        if not cid:
+            continue
+        incoming_ids.add(cid)
+        incoming_by_id[cid] = {
+            "max_chat_id": cid,
+            "title": ch.title or "",
+            "type": ch.type or "",
+        }
+
+    # 1) Помечаем stale для пропавших MAX-чатов (по всем владельцам).
+    from sqlalchemy import select as _sel
+    with db.session_scope() as s:
+        existing_topic_ids = {
+            row[0] for row in s.execute(_sel(db.ChatTopic.max_chat_id)).all()
+        }
+    missing_ids = [
+        cid for cid in existing_topic_ids if cid not in incoming_ids
+    ]
+    stale_marked = db.mark_topics_stale(missing_ids) if missing_ids else 0
+
+    # 2) Создаём задания на create/rename для каждого владельца.
+    enqueued_total = 0
+    by_action: dict = {"create": 0, "rename": 0}
+    with db.session_scope() as s:
+        owners = s.query(db.SuperGroup).all()
+        s.expunge_all()
+    for sg in owners:
+        created = db.enqueue_topic_sync_jobs(
+            owner_user_id=int(sg.owner_user_id),
+            chats=list(incoming_by_id.values()),
+            supergroup_chat_id=int(sg.supergroup_chat_id),
+        )
+        enqueued_total += len(created)
+        # Точное распределение create/rename — посмотрим в stats после.
+    stats = db.get_topic_sync_stats()
+    by_action["create"] = stats.get("pending_create", 0)
+    by_action["rename"] = stats.get("pending_rename", 0)
+
+    logger.info(
+        "internal_sync_topics: trigger=%s incoming=%d missing=%d "
+        "stale_marked=%d enqueued_jobs=%d stale_topics_total=%d",
+        trigger, len(incoming_ids), len(missing_ids), stale_marked,
+        enqueued_total, db.count_stale_topics(),
+    )
+
+    return SyncTopicsOut(
+        trigger=trigger,
+        synced_chats=len(incoming_ids),
+        enqueued_jobs=enqueued_total,
+        by_action=by_action,
+        stale_topics=db.count_stale_topics(),
+    )
+
+
+# ---------- Очередь задач на синк топиков (для bot-воркера) ----------
+
+
+class TopicJobOut(BaseModel):
+    id: int
+    owner_user_id: int
+    max_chat_id: str
+    chat_title: Optional[str] = None
+    action: str
+    attempts: int
+
+
+class TopicJobList(BaseModel):
+    jobs: List[TopicJobOut]
+
+
+class TopicJobFinishIn(BaseModel):
+    ok: bool = True
+    error: Optional[str] = None
+
+
+@app.get(
+    "/topic_jobs/claim",
+    response_model=TopicJobList,
+    dependencies=[Depends(verify_api_key)],
+)
+def topic_jobs_claim(limit: int = Query(default=5, ge=1, le=50)) -> TopicJobList:
+    """Bot-воркер раз в 2 секунды забирает пачку pending-джобов и
+    превращает их в ``createForumTopic`` / ``editForumTopic``. Здесь только
+    переводим в ``in_progress`` и возвращаем уже обновлённые строки.
+    """
+    rows = db.claim_pending_topic_jobs(limit=limit)
+    return TopicJobList(
+        jobs=[
+            TopicJobOut(
+                id=int(j.id),
+                owner_user_id=int(j.owner_user_id),
+                max_chat_id=str(j.max_chat_id),
+                chat_title=j.chat_title,
+                action=str(j.action),
+                attempts=int(j.attempts or 0),
+            )
+            for j in rows
+        ]
+    )
+
+
+@app.post(
+    "/topic_jobs/{job_id}/finish",
+    response_model=OkOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def topic_jobs_finish(job_id: int, body: TopicJobFinishIn) -> OkOut:
+    """Bot-воркер сообщает об успехе/ошибке после выполнения джоба.
+
+    Параллельно: при ``action="rename"`` и ``ok=True`` — обновляем
+    ``ChatTopic.topic_name`` в БД, чтобы при следующем sync не было
+    ложного «title поменялся».
+    """
+    db.finish_topic_sync_job(job_id, ok=body.ok, error=body.error)
+    if body.ok:
+        # Заодно синхронизируем ChatTopic.topic_name, если джоб был rename.
+        try:
+            with db.session_scope() as s:
+                row = s.get(db.TopicSyncJob, job_id)
+                if row is not None and row.action == "rename":
+                    db.update_topic_name(
+                        str(row.max_chat_id), (row.chat_title or "").strip()
+                    )
+        except Exception as exc:
+            logger.warning(
+                "topic_jobs_finish: update_topic_name for job %s failed: %s",
+                job_id, exc,
+            )
+    return OkOut(ok=True)
+
+
+@app.get(
+    "/topic_jobs/stats",
+    dependencies=[Depends(verify_api_key)],
+)
+def topic_jobs_stats() -> dict:
+    """Сводка по очереди задач (для диагностики)."""
+    return db.get_topic_sync_stats()
+
+
+# ---------- Stale-топики: список и закрытие (для /prune_topics) ----------
+
+
+class StaleTopicOut(BaseModel):
+    max_chat_id: str
+    supergroup_chat_id: int
+    thread_id: int
+    topic_name: Optional[str] = None
+
+
+class StaleTopicList(BaseModel):
+    topics: List[StaleTopicOut]
+
+
+@app.get(
+    "/topics/stale",
+    response_model=StaleTopicList,
+    dependencies=[Depends(verify_api_key)],
+)
+def topics_stale(owner_user_id: int = Query(...)) -> StaleTopicList:
+    """Список stale-топиков (``stale=1``) для конкретного владельца.
+    Бот вызывает из команды ``/prune_topics``.
+    """
+    rows = db.list_stale_topics(int(owner_user_id))
+    return StaleTopicList(
+        topics=[
+            StaleTopicOut(
+                max_chat_id=str(t.max_chat_id),
+                supergroup_chat_id=int(t.supergroup_chat_id),
+                thread_id=int(t.thread_id),
+                topic_name=t.topic_name,
+            )
+            for t in rows
+        ]
+    )
+
+
+class CloseTopicIn(BaseModel):
+    """Запрос от бота: пометить топик закрытым (``stale=2``) после
+    успешного ``closeForumTopic``. Саму операцию closeForumTopic бот
+    выполняет сам (он единственный, у кого есть Bot)."""
+
+    owner_user_id: int
+
+
+@app.post(
+    "/topics/{max_chat_id}/close",
+    response_model=OkOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def topics_close(max_chat_id: str, body: CloseTopicIn) -> OkOut:
+    """Пометить топик закрытым. Проверяем, что топик принадлежит
+    ``owner_user_id`` — иначе бот может закрыть чужой топик.
+    """
+    with db.session_scope() as s:
+        sg = (
+            s.query(db.SuperGroup)
+            .filter(db.SuperGroup.owner_user_id == int(body.owner_user_id))
+            .first()
+        )
+        if not sg:
+            raise HTTPException(status_code=404, detail="owner has no supergroup")
+        topic = (
+            s.query(db.ChatTopic)
+            .filter(
+                db.ChatTopic.max_chat_id == str(max_chat_id),
+                db.ChatTopic.supergroup_chat_id == int(sg.supergroup_chat_id),
+            )
+            .first()
+        )
+        if not topic:
+            raise HTTPException(status_code=404, detail="topic not found")
+        topic.stale = 2
+        topic.updated_at = datetime.utcnow()
+    return OkOut(ok=True)
+
+
 # ---------- Внутренние уведомления (опционально, для отладки) ----------
 
 

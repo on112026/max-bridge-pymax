@@ -18,6 +18,7 @@ from app.api_client import api
 from app.config import settings
 from app.forwarder import EventPoller
 from app.handlers import AuthWatcher, register_handlers
+from app.topic_worker import TopicSyncWorker
 from shared import db as shared_db
 from shared.log_setup import configure_logging
 
@@ -61,14 +62,21 @@ async def main() -> None:
 
     auth_watcher = AuthWatcher(bot=bot)
 
+    # Воркер синхронизации топиков (создание/переименование после auth=ok).
+    # Всегда запускаем — если владелец ещё не сделал /setgroup, воркер
+    # просто будет возвращать джобы в pending (см. ``TopicSyncWorker``).
+    topic_worker = TopicSyncWorker(bot=bot)
+
     try:
         if owner_uid:
             await poller.start()
         auth_watcher.start()
+        topic_worker.start()
         await dp.start_polling(bot)
     finally:
         await poller.stop()
         await auth_watcher.stop()
+        await topic_worker.stop()
         with suppress(Exception):
             await api.close()
         with suppress(Exception):
