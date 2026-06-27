@@ -1,8 +1,10 @@
 """Фоновый поллер: забирает недоставленные события и пересылает в Telegram.
 
 Каждое событие идёт в свой Telegram-топик в приватной supergroup
-владельца (создаётся через ``/setup``). Имя топика — ``chat_title (MAX: <id>)``
-(см. ``app/topics.py``).
+владельца (создаётся через ``/setup``). Имя топика — ``chat_title``
+с подписью типа чата: ``(ЛС: <id>)`` / ``(группа: <id>)`` / ``(канал: <id>)``
+(см. ``app/topics.py``). Если тип чата неизвестен — используется старый
+формат ``(MAX: <id>)``.
 
 Если пользователь ещё не сделал ``/setup`` — события остаются
 ``undelivered=False`` и будут отправлены, как только появится supergroup.
@@ -99,11 +101,25 @@ class EventPoller:
             try:
                 max_chat_id = str(ev.get("max_chat_id") or "")
                 chat_title = ev.get("chat_title") or ""
+                # Тип чата из кеша MAX (DIALOG/CHAT/CHANNEL). Если кеш
+                # ещё не синхронизирован — ``None`` и имя топика соберётся
+                # в старом формате ``(MAX: <id>)``.
+                chat_type: Optional[str] = None
+                try:
+                    chat_row = shared_db.get_chat(max_chat_id)
+                    if chat_row is not None:
+                        chat_type = getattr(chat_row, "type", None) or None
+                except Exception as exc:
+                    logger.debug(
+                        "forward event %s: get_chat(%s) failed: %s",
+                        ev.get("id"), max_chat_id, exc,
+                    )
                 thread_id = await get_or_create_topic(
                     self.bot,
                     sg_chat_id,
                     max_chat_id,
                     chat_title,
+                    chat_type=chat_type,
                 )
                 if thread_id is None:
                     logger.warning(

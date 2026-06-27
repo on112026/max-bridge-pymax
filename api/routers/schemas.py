@@ -208,6 +208,10 @@ class TopicJobOut(BaseModel):
     owner_user_id: int
     max_chat_id: str
     chat_title: Optional[str] = None
+    # Тип чата из MAX (``DIALOG`` / ``CHAT`` / ``CHANNEL``) — нужен
+    # бот-воркеру, чтобы в имени топика подставлять «ЛС»/«группа»/«канал»
+    # вместо безликого «MAX». ``None`` для старых джобов.
+    chat_type: Optional[str] = None
     action: str
     attempts: int
 

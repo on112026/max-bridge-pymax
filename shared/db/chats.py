@@ -13,7 +13,7 @@ MAX-процесс обновляет кэш в двух сценариях:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import select
 
@@ -57,3 +57,25 @@ def list_chats(limit: int = 100) -> List[Chat]:
         )
         s.expunge_all()
         return list(rows)
+
+
+def get_chat(max_chat_id: str) -> Optional[Chat]:
+    """Вернуть одну запись о MAX-чате по ``max_chat_id`` или ``None``.
+
+    Используется ботом (``forwarder.py``) чтобы достать ``chat.type``
+    (DIALOG/CHAT/CHANNEL) для формирования имени топика. Если записи
+    ещё нет (MAX-процесс не успел синхронизировать кеш) — возвращает
+    ``None``, и вызывающий код использует старый формат ``(MAX: <id>)``.
+    """
+    with session_scope() as s:
+        row = (
+            s.execute(
+                select(Chat).where(Chat.max_chat_id == str(max_chat_id))
+            )
+            .scalars()
+            .first()
+        )
+        if row is None:
+            return None
+        s.expunge(row)
+        return row

@@ -47,6 +47,7 @@ def topic_jobs_claim(limit: int = Query(default=5, ge=1, le=50)) -> TopicJobList
                 owner_user_id=int(j.owner_user_id),
                 max_chat_id=str(j.max_chat_id),
                 chat_title=j.chat_title,
+                chat_type=getattr(j, "chat_type", None),
                 action=str(j.action),
                 attempts=int(j.attempts or 0),
             )

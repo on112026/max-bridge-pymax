@@ -110,6 +110,14 @@ class TopicSyncWorker:
         action = str(job.get("action") or "")
         attempts = int(job.get("attempts") or 0)
         chat_title = job.get("chat_title")
+        # Тип чата из MAX (DIALOG/CHAT/CHANNEL) — кладётся в джоб в
+        # ``shared/db/topic_jobs.py::enqueue_topic_sync_jobs`` из
+        # payload ``/internal/sync_topics``. Используется при формировании
+        # имени топика, чтобы вместо ``(MAX: <id>)`` подставлять
+        # ``(ЛС: <id>)`` / ``(группа: <id>)`` / ``(канал: <id>)``.
+        chat_type = job.get("chat_type") or None
+        if chat_type is not None:
+            chat_type = str(chat_type).strip() or None
 
         if not job_id or not max_chat_id or action not in ("create", "rename"):
             await self._finish(job_id, ok=False, error="malformed job")
@@ -149,6 +157,7 @@ class TopicSyncWorker:
                     supergroup_chat_id=supergroup_chat_id,
                     max_chat_id=max_chat_id,
                     chat_title=chat_title,
+                    chat_type=chat_type,
                 )
                 ok = thread_id is not None
                 if not ok:
@@ -163,6 +172,7 @@ class TopicSyncWorker:
                         supergroup_chat_id=supergroup_chat_id,
                         max_chat_id=max_chat_id,
                         chat_title=chat_title,
+                        chat_type=chat_type,
                     )
                     ok = thread_id is not None
                     if not ok:
@@ -174,6 +184,7 @@ class TopicSyncWorker:
                         thread_id=int(existing.thread_id),
                         max_chat_id=max_chat_id,
                         new_chat_title=chat_title,
+                        chat_type=chat_type,
                     )
                     if not ok:
                         error_text = "editForumTopic failed"

@@ -41,7 +41,9 @@ def enqueue_topic_sync_jobs(
 ) -> List[int]:
     """Положить пачку задач ``create``/``rename`` в ``topic_sync_jobs``.
 
-    ``chats`` — список ``{max_chat_id, title}``. Для каждого:
+    ``chats`` — список ``{max_chat_id, title, type}`` (поле ``type``
+    опционально — это тип чата из MAX: ``DIALOG`` / ``CHAT`` / ``CHANNEL``).
+    Для каждого:
 
     * если топика ещё нет в ``chat_topics`` → ``action="create"``;
     * если топик есть и ``title`` поменялся → ``action="rename"``.
@@ -75,6 +77,9 @@ def enqueue_topic_sync_jobs(
             if not cid:
                 continue
             title = (chat.get("title") or "").strip() or None
+            chat_type = chat.get("type") or None
+            if chat_type is not None:
+                chat_type = str(chat_type).strip() or None
             existing_topic = existing_topics.get(cid)
             if existing_topic is None:
                 action = "create"
@@ -96,6 +101,7 @@ def enqueue_topic_sync_jobs(
                 owner_user_id=int(owner_user_id),
                 max_chat_id=cid,
                 chat_title=title,
+                chat_type=chat_type,
                 action=action,
                 status="pending",
             ))

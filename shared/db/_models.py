@@ -236,6 +236,12 @@ class TopicSyncJob(Base):
     задач через ``POST /internal/sync_topics``. Bot-процесс (TopicSyncWorker)
     раз в 2 секунды забирает pending-джобы и через ``createForumTopic`` /
     ``editForumTopic`` создаёт/переименовывает топики, помечая джоб done/failed.
+
+    ``chat_type`` — тип чата из MAX (``DIALOG`` / ``CHAT`` / ``CHANNEL``),
+    прокидывается из payload ``/internal/sync_topics``. Используется бот-воркером
+    при формировании имени топика, чтобы вместо ``(MAX: <id>)`` показывать
+    ``(ЛС: <id>)`` / ``(группа: <id>)`` / ``(канал: <id>)``. Может быть
+    ``None`` для старых джобов и для неизвестных типов.
     """
 
     __tablename__ = "topic_sync_jobs"
@@ -253,3 +259,5 @@ class TopicSyncJob(Base):
     finished_at = Column(DateTime, nullable=True)
     # Количество попыток (для backoff в worker'е).
     attempts = Column(Integer, nullable=False, default=0)
+    # Тип чата из MAX: "DIALOG" | "CHAT" | "CHANNEL" | None.
+    chat_type = Column(String, nullable=True)

@@ -28,16 +28,57 @@ logger = logging.getLogger(__name__)
 TOPIC_NAME_MAX_LEN = 128
 
 
-def _make_topic_display_name(chat_title: str, max_chat_id: str) -> str:
-    """Собирает имя топика формата ``chat_title (MAX: <id>)``.
+# Маппинг типа чата из pymax (``pymax.types.domain.enums.ChatType``) на
+# короткую русскую подпись для имени топика. В pymax есть только
+# DIALOG/CHAT/CHANNEL — отдельного «бот» в библиотеке нет, поэтому
+# личные диалоги (включая чаты с ботами MAX) всегда отрисовываются
+# как «ЛС». Если MAX пришлёт неизвестное значение — фолбэк на «MAX».
+_CHAT_TYPE_LABEL = {
+    "DIALOG": "ЛС",
+    "CHAT": "группа",
+    "CHANNEL": "канал",
+}
 
-    Если ``chat_title`` пустое — используем только ``(MAX: <id>)``.
+
+def _format_type_label(chat_type: Optional[str]) -> Optional[str]:
+    """Вернуть русскую подпись для типа чата или ``None`` если неизвестен.
+
+    ``None``/пустая строка → ``None`` (используется как сигнал «оставить
+    старый формат ``(MAX: <id>)`` для обратной совместимости и для
+    чатов без известного типа).
+    """
+    if not chat_type:
+        return None
+    return _CHAT_TYPE_LABEL.get(str(chat_type).strip().upper())
+
+
+def _make_topic_display_name(
+    chat_title: str,
+    max_chat_id: str,
+    chat_type: Optional[str] = None,
+) -> str:
+    """Собирает имя топика.
+
+    Формат зависит от ``chat_type``:
+
+    * ``DIALOG`` → ``"<title> (ЛС: <id>)"`` (или ``"(ЛС: <id>)"`` если
+      имя пустое);
+    * ``CHAT``   → ``"<title> (группа: <id>)"``;
+    * ``CHANNEL``→ ``"<title> (канал: <id>)"``;
+    * неизвестный тип или ``None`` → старый формат ``(MAX: <id>)``.
+
+    Лимит Telegram Bot API — 128 символов.
     """
     title = (chat_title or "").strip()
-    if title:
-        name = f"{title} (MAX: {max_chat_id})"
+    label = _format_type_label(chat_type)
+    if label:
+        prefix = f"({label}: {max_chat_id})"
     else:
-        name = f"(MAX: {max_chat_id})"
+        prefix = f"(MAX: {max_chat_id})"
+    if title:
+        name = f"{title} {prefix}"
+    else:
+        name = prefix
     return name[:TOPIC_NAME_MAX_LEN]
 
 
@@ -46,28 +87,47 @@ async def get_or_create_topic(
     supergroup_chat_id: int,
     max_chat_id: str,
     chat_title: Optional[str] = None,
+    chat_type: Optional[str] = None,
 ) -> Optional[int]:
     """Возвращает ``message_thread_id`` для ``max_chat_id``.
 
     Если топик ещё не создан — создаёт его в указанной supergroup
-    с именем ``chat_title (MAX: <id>)``. Возвращает ``None`` при ошибке
-    (например, бот не админ в группе).
+    с именем ``chat_title (<label>: <id>)`` (``label`` — русская подпись
+    типа чата: «ЛС» / «группа» / «канал»). Если ``chat_type`` неизвестен
+    или не передан — имя строится в старом формате ``(MAX: <id>)``.
+
+    ``chat_type`` — тип чата из pymax (``DIALOG`` / ``CHAT`` / ``CHANNEL``),
+    пробрасывается из payload ``/internal/sync_topics`` и из таблицы ``chats``.
+
+    Возвращает ``None`` при ошибке (например, бот не админ в группе).
     """
     max_chat_id = str(max_chat_id)
     existing = shared_db.get_topic(max_chat_id)
     if existing:
-        # Если имя в MAX поменялось — переименовываем топик.
+        # Если имя в MAX поменялось или поменялся тип чата (chat_type
+        # известен и его метка отличается от текущей в имени) —
+        # переименовываем топик.
         desired_name = (chat_title or existing.topic_name or "").strip() or max_chat_id
-        if desired_name != existing.topic_name:
+        new_display_name = _make_topic_display_name(
+            desired_name, max_chat_id, chat_type=chat_type
+        )
+        current_display_name = _make_topic_display_name(
+            existing.topic_name or "", max_chat_id, chat_type=chat_type,
+        )
+        if (
+            new_display_name != current_display_name
+            and new_display_name != (existing.topic_name or "")
+        ):
             try:
                 await bot(EditForumTopic(
                     chat_id=supergroup_chat_id,
                     message_thread_id=existing.thread_id,
-                    name=_make_topic_display_name(desired_name, max_chat_id),
+                    name=new_display_name,
                 ))
                 shared_db.update_topic_name(max_chat_id, desired_name)
                 logger.info(
-                    "renamed topic for %s → %r", max_chat_id, desired_name
+                    "renamed topic for %s → %r (type=%s)",
+                    max_chat_id, desired_name, chat_type,
                 )
             except (TelegramAPIError, TelegramRetryAfter) as exc:
                 logger.warning(
@@ -75,7 +135,9 @@ async def get_or_create_topic(
                 )
         return existing.thread_id
 
-    display_name = _make_topic_display_name(chat_title or "", max_chat_id)
+    display_name = _make_topic_display_name(
+        chat_title or "", max_chat_id, chat_type=chat_type,
+    )
     try:
         topic = await bot(CreateForumTopic(
             chat_id=supergroup_chat_id,
@@ -94,8 +156,8 @@ async def get_or_create_topic(
         topic_name=(chat_title or "").strip() or None,
     )
     logger.info(
-        "created topic for %s: thread_id=%s name=%r",
-        max_chat_id, topic.message_thread_id, display_name,
+        "created topic for %s: thread_id=%s name=%r (type=%s)",
+        max_chat_id, topic.message_thread_id, display_name, chat_type,
     )
     return topic.message_thread_id
 
@@ -138,16 +200,23 @@ async def rename_topic(
     thread_id: int,
     max_chat_id: str,
     new_chat_title: Optional[str],
+    chat_type: Optional[str] = None,
 ) -> bool:
     """Переименовать существующий топик и обновить ``ChatTopic.topic_name``.
 
     Используется из ``TopicSyncWorker`` при ``action="rename"``.
 
+    ``chat_type`` — опциональный тип чата из MAX (``DIALOG`` / ``CHAT`` /
+    ``CHANNEL``). Если передан — в имени топика будет «ЛС»/«группа»/«канал»
+    вместо безликого «MAX». При ``None`` сохраняется старый формат.
+
     Возвращает ``True`` при успехе. На любой Telegram-ошибке возвращает
     ``False`` и не обновляет БД, чтобы воркер мог пометить джоб failed.
     """
     new_title = (new_chat_title or "").strip()
-    display_name = _make_topic_display_name(new_title, max_chat_id)
+    display_name = _make_topic_display_name(
+        new_title, max_chat_id, chat_type=chat_type,
+    )
     try:
         await bot(EditForumTopic(
             chat_id=supergroup_chat_id,
@@ -162,8 +231,8 @@ async def rename_topic(
         return False
     shared_db.update_topic_name(max_chat_id, new_title)
     logger.info(
-        "renamed topic for %s → %r (thread=%s)",
-        max_chat_id, new_title, thread_id,
+        "renamed topic for %s → %r (thread=%s, type=%s)",
+        max_chat_id, new_title, thread_id, chat_type,
     )
     return True
 

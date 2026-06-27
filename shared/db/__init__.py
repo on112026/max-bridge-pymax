@@ -74,6 +74,7 @@ from shared.db.events import (  # noqa: F401
 
 # chats
 from shared.db.chats import (  # noqa: F401
+    get_chat,
     list_chats,
     upsert_chat,
 )
