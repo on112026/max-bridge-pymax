@@ -82,6 +82,127 @@ def _chat_to_dict(chat: MaxChat) -> dict:
     }
 
 
+def _display_name_of(chat: Any) -> Optional[str]:
+    """Отдаёт «человеческое» имя чата: ``chat.title`` или обогащённое.
+
+    Обогащение делается в ``_enrich_chat_titles`` (вызывается перед этим
+    в ``_on_start``), где мы подменяем ``chat.title`` на имя собеседника /
+    первого участника для чатов с пустым ``title``. Здесь просто читаем.
+    """
+    title = (getattr(chat, "title", None) or "").strip()
+    return title or None
+
+
+async def _enrich_chat_titles(client: Any, chats: list) -> None:
+    """Обогащает ``chat.title`` для чатов, у которых MAX вернул пустое имя.
+
+    Нужно, чтобы ``TopicSyncWorker`` создал топики сразу с человеческими
+    именами, а не с ``(MAX: <id>)`` или пустой строкой.
+
+    Логика (повторяет ту, что в ``_on_message``, но батчем):
+      * **DIALOG**: ``peer_id = chat_id ^ me_id`` → ``client.users[peer_id]``
+        или ``await client.get_user(peer_id)`` → ``_user_display_name``.
+      * **CHAT / CHANNEL**: перебираем ``chat.participants`` (исключая self),
+        для каждого берём ``client.users[uid]`` или догружаем через
+        ``client.get_user(uid)``; имя первого непустого становится title.
+
+    Если ничего не нашли — оставляем title пустым (текущее поведение:
+    в Telegram-топике будет ``(MAX: <id>)``).
+    """
+    if not chats:
+        return
+    me = getattr(client, "me", None)
+    me_id = getattr(getattr(me, "contact", None), "id", None) if me else None
+    enriched = 0
+    for chat in chats:
+        try:
+            existing_title = (getattr(chat, "title", None) or "").strip()
+            if existing_title:
+                continue
+            chat_id_raw = getattr(chat, "id", None)
+            if chat_id_raw is None:
+                continue
+            chat_id_int = int(chat_id_raw)
+            chat_type = getattr(chat, "type", None)
+            users_map = getattr(client, "users", None) or {}
+            resolved_name: Optional[str] = None
+            resolved_peer_id: Optional[int] = None
+
+            if chat_type == ChatType.DIALOG and me_id is not None:
+                # DIALOG: peer_id = chat_id XOR me_id
+                try:
+                    peer_id = chat_id_int ^ int(me_id)
+                except (TypeError, ValueError):
+                    peer_id = None
+                if peer_id is not None and peer_id > 0:
+                    user = users_map.get(peer_id)
+                    if user is None and hasattr(client, "get_user"):
+                        try:
+                            fetched = await client.get_user(peer_id)
+                            if fetched is not None:
+                                user = fetched
+                                try:
+                                    users_map[peer_id] = fetched
+                                except Exception:
+                                    pass
+                        except Exception as exc:
+                            logger.info(
+                                "enrich: get_user(%s) failed: %s", peer_id, exc,
+                            )
+                    if user is not None:
+                        resolved_name = _user_display_name(user)
+                        resolved_peer_id = peer_id
+            else:
+                # CHAT / CHANNEL: первый участник ≠ self с непустым именем.
+                participants = getattr(chat, "participants", None) or {}
+                for uid in participants.keys():
+                    if me_id is not None and uid == me_id:
+                        continue
+                    user = users_map.get(uid)
+                    if user is None and hasattr(client, "get_user"):
+                        try:
+                            fetched = await client.get_user(uid)
+                            if fetched is not None:
+                                user = fetched
+                                try:
+                                    users_map[uid] = fetched
+                                except Exception:
+                                    pass
+                        except Exception as exc:
+                            logger.info(
+                                "enrich: get_user(%s) failed: %s", uid, exc,
+                            )
+                            user = None
+                    candidate = _user_display_name(user)
+                    if candidate:
+                        resolved_name = candidate
+                        resolved_peer_id = int(uid)
+                        break
+
+            if resolved_name:
+                # Подменяем атрибут ``title`` на обогащённое имя. pymax
+                # использует Pydantic v1/v2 — в обоих случаях ``__setattr__``
+                # работает (модель mutable, allow_mutations=True в v1).
+                try:
+                    chat.title = resolved_name
+                    enriched += 1
+                    logger.info(
+                        "enrich: chat=%s type=%s peer=%s → %r",
+                        chat_id_raw, chat_type, resolved_peer_id, resolved_name,
+                    )
+                except Exception as exc:
+                    logger.info(
+                        "enrich: failed to set title for chat=%s: %s",
+                        chat_id_raw, exc,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "enrich: chat=%s failed: %s", getattr(chat, "id", "?"), exc,
+            )
+    if enriched:
+        logger.info("enrich: обогатили %d/%d чатов именами", enriched, len(chats))
+
+
 async def _post(path: str, json: dict | None = None) -> None:
     try:
         async with httpx.AsyncClient(base_url=API_BASE, timeout=30.0) as c:
@@ -268,6 +389,16 @@ def register_bridge(client) -> None:
             except Exception as exc:
                 logger.warning("on_start: fetch_chats retry failed: %s", exc)
 
+        # 0) Обогащаем ``title`` для чатов, у которых MAX его не вернул.
+        # Это особенно важно для личных диалогов (DIALOG): MAX кладёт
+        # имя собеседника не в ``chat.title``, а в ``client.users[user_id].
+        # names``. Сразу после login ``client.users`` может быть пуст — тогда
+        # без обогащения в Telegram-группе создаются топики ``(MAX: <id>)``
+        # или вообще пустые. Логика та же, что и в ``_on_message``: для
+        # DIALOG тянем peer-юзера через XOR ``me_id ^ chat_id``, для
+        # групповых чатов без title — имя первого участника.
+        await _enrich_chat_titles(client, chats_list)
+
         # 1) Поэлементно синхронизируем каждую запись чата в БД (источник
         # истины для ``chats`` используется ``/chats``-эндпоинтом).
         if chats_list:
@@ -294,7 +425,7 @@ def register_bridge(client) -> None:
                 "chats": [
                     {
                         "max_chat_id": str(getattr(c, "id", "")),
-                        "title": getattr(c, "title", None) or "",
+                        "title": _display_name_of(c) or "",
                         "type": str(getattr(c, "type", "") or ""),
                     }
                     for c in chats_list
