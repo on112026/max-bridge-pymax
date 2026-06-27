@@ -39,6 +39,7 @@ from shared.log_setup import configure_logging  # noqa: E402
 
 from api.routers import (  # noqa: E402
     auth,
+    chat_ops,
     chats,
     events,
     health,
@@ -75,3 +76,4 @@ app.include_router(sessions.router)
 app.include_router(topic_jobs.router)
 app.include_router(topics.router)
 app.include_router(sync.router)
+app.include_router(chat_ops.router)

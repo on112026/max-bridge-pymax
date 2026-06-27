@@ -141,3 +141,18 @@ from shared.db.topic_jobs import (  # noqa: F401
     finish_topic_sync_job,
     get_topic_sync_stats,
 )
+
+# chat_ops_queue — очередь операций над чатами/пользователями MAX
+# (join/invite/заявки/поиск пользователя). Аналог ``send_queue``, только
+# для админских операций через ``pymax.Client``. MAX-процесс
+# (``chat_ops_loop``) забирает задачи polling'ом.
+from shared.db.chat_ops_queue import (  # noqa: F401
+    enqueue_chat_op,
+    claim_next_chat_op,
+    finish_chat_op,
+    get_chat_op,
+    queue_stats as chat_ops_queue_stats,
+    requeue_failed as requeue_failed_chat_op,
+    payload_of as chat_op_payload_of,
+    result_of as chat_op_result_of,
+)

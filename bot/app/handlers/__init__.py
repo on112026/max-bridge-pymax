@@ -14,6 +14,9 @@
 * ``auth`` — ``/reauth_sms``, ``/code``, ``event_action_callback``,
   ``auth_action_callback``, ``topic_message_to_max``.
 * ``prune_topics`` — ``/prune_topics``, ``prune_topic_callback``.
+* ``chat_ops`` — ``/join`` / ``/resolve`` / ``/invite`` / ``/search_user`` /
+  ``/pending`` / ``/approve`` / ``/decline`` / ``/chatops`` (пакет с подмодулями
+  ``join`` / ``invite`` / ``join_requests`` / ``help`` / ``_common``).
 * ``auth_watcher`` — фоновый ``AuthWatcher`` (поллер ``/status`` → уведомления).
 * ``registration`` — единственная публичная ``register_handlers(dp)``.
 

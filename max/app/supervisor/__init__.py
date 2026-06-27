@@ -53,6 +53,7 @@ from typing import Optional
 
 from pymax import Client
 
+from app import chat_ops
 from app.sender import sender_loop
 from app.supervisor._backoff import (
     AUTH_FAIL_BACKOFF,
@@ -104,6 +105,9 @@ async def run() -> None:
     drain_task: Optional[asyncio.Task] = None
     session_task: Optional[asyncio.Task] = None
     read_receipts_task: Optional[asyncio.Task] = None
+    # Фоновая задача chat-операций (join/invite/заявки). Хранит
+    # ссылку на живой Client через ``chat_ops.set_client``.
+    chat_ops_task: Optional[asyncio.Task] = None
     rate_limit_until: float = 0.0
     last_sms_request_at: float = 0.0
 
@@ -203,6 +207,13 @@ async def run() -> None:
         read_receipts_loop(stop_event, _client_getter),
         name="read-receipts",
     )
+    # Chat-ops — отдельная фоновая задача. Работает даже когда Client
+    # не поднят (``auth_required``): задачи из ``chat_ops_queue`` просто
+    # копятся в БД, и ``chat_ops.is_ready()`` сразу даст сигнал,
+    # когда Client появится.
+    chat_ops_task = asyncio.create_task(
+        chat_ops.chat_ops_loop(stop_event), name="chat-ops",
+    )
 
     try:
         while not stop_event.is_set():
@@ -273,6 +284,9 @@ async def run() -> None:
                         pass
                 client = None
                 client_task = None
+                # Публикуем факт смерти Client'а в ``chat_ops``,
+                # чтобы ``chat_ops_loop`` приостановил обработку.
+                chat_ops.clear_client()
 
                 if exc is not None:
                     logger.warning("client_task exited with error: %s", exc)
@@ -374,6 +388,7 @@ async def run() -> None:
                 shared_db.set_auth_state("unknown", error=None, clear_error=True)
                 shared_db.set_notify_message("🔐 Запрашиваю SMS-код у MAX…")
                 client = build_client(phone, cache_dir)
+                chat_ops.set_client(client)
                 client_task = asyncio.create_task(
                     _long_running_start(client, stop_event), name="pymax-client",
                 )
@@ -430,6 +445,7 @@ async def run() -> None:
                 shared_db.set_auth_state("session_attached", error=None, clear_error=True)
                 shared_db.set_notify_message("📂 Подключаюсь по сохранённой сессии…")
                 client = build_client(phone, cache_dir)
+                chat_ops.set_client(client)
                 client_task = asyncio.create_task(
                     _long_running_start(client, stop_event), name="pymax-client",
                 )
@@ -478,6 +494,13 @@ async def run() -> None:
                 await read_receipts_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if chat_ops_task is not None and not chat_ops_task.done():
+            chat_ops_task.cancel()
+            try:
+                await chat_ops_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        chat_ops.clear_client()
         if client is not None:
             try:
                 await client.close()

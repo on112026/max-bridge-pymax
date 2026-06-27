@@ -26,7 +26,7 @@ from aiogram import Dispatcher, F
 # Импорт из подмодулей нужен для регистрации, поэтому используем обычный import.
 # ``auth`` и ``supergroup`` — теперь пакеты с несколькими модулями.
 from app.handlers import auth  # noqa: F401  (reauth / event_callbacks / auth_action / topic_echo)
-from app.handlers import basic, prune_topics, reply, sessions  # noqa: F401
+from app.handlers import basic, chat_ops, prune_topics, reply, sessions  # noqa: F401
 from app.handlers import supergroup  # noqa: F401  (attach + commands)
 from app.keyboards import (
     AuthActionCallback,
@@ -69,6 +69,9 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(supergroup.getlink_command, F.text == "/getlink")
 
     dp.message.register(prune_topics.prune_topics_command, F.text == "/prune_topics")
+
+    # ---------- Chat-операции MAX (join / invite / заявки / поиск) ----------
+    chat_ops.register_handlers(dp)
 
     # ---------- Reply-кнопки (по точному тексту) ----------
     dp.message.register(basic.button_status, F.text == "ℹ️ Статус")

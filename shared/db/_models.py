@@ -261,3 +261,50 @@ class TopicSyncJob(Base):
     attempts = Column(Integer, nullable=False, default=0)
     # Тип чата из MAX: "DIALOG" | "CHAT" | "CHANNEL" | None.
     chat_type = Column(String, nullable=True)
+
+
+class ChatOpsQueue(Base):
+    """Очередь операций над чатами/пользователями MAX (join/invite/заявки).
+
+    Аналог ``SendQueue`` для chat-операций: API принимает команду от бота
+    и кладёт её сюда, MAX-процесс (``chat_ops_loop``) периодически забирает
+    pending-задачу, выполняет через ``pymax.Client`` и помечает результат.
+
+    ``op`` — тип операции:
+
+    * ``"join"``                — вступить в группу/канал по ``link`` → ``payload.link``.
+    * ``"resolve"``             — превью чата по ``link`` → ``payload.link``.
+    * ``"invite"``              — пригласить пользователей → ``payload.chat_id``,
+                                  ``payload.user_ids`` (list[int]),
+                                  ``payload.show_history`` (bool).
+    * ``"list_join_requests"``  — список заявок → ``payload.chat_id``.
+    * ``"confirm_join_request"``— принять заявки → ``payload.chat_id``,
+                                  ``payload.user_ids`` (list[int]).
+    * ``"decline_join_request"``— отклонить заявки → ``payload.chat_id``,
+                                  ``payload.user_ids`` (list[int]).
+    * ``"search_user"``         — поиск пользователя по телефону → ``payload.phone``.
+
+    ``payload`` — JSON с параметрами операции (сериализуется как TEXT).
+    ``result_json`` — JSON с результатом (для синхронных операций
+    ``list_join_requests`` / ``search_user`` сразу сюда кладётся ответ).
+    """
+
+    __tablename__ = "chat_ops_queue"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Тип операции (см. docstring).
+    op = Column(String, nullable=False, index=True)
+    # Создатель задачи (owner_user_id из TG). Не используется для исполнения,
+    # только для аудита в /status.
+    created_by = Column(Integer, nullable=True)
+    # JSON-payload операции.
+    payload = Column(Text, nullable=False, default="{}")
+    # "pending" | "in_progress" | "done" | "failed".
+    status = Column(String, nullable=False, default="pending", index=True)
+    error = Column(Text, nullable=True)
+    # JSON с результатом для синхронных операций.
+    result_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    # Количество попыток (для будущего backoff в worker'е).
+    attempts = Column(Integer, nullable=False, default=0)

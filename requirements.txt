@@ -1,15 +1,20 @@
-# Зависимости max-bridge-pymax.
+# Общие runtime-зависимости max-bridge-pymax.
+#
 # PyMax вендорится в ./vendor/pymax и НЕ ставится из PyPI (см. vendor/README.md).
+# Его runtime-зависимости вынесены в max/requirements.txt, чтобы пакет
+# max/ был самодостаточным (собрать max-процесс отдельно = взять
+# requirements.txt + max/requirements.txt).
 
-# --- PyMax runtime deps (из PyMax/pyproject.toml, version 2.2.0) ---
-aiofiles>=23.2.1,<24.2
-aiohttp==3.10.10
-aiosqlite>=0.22.1
-msgpack>=1.1.2
+# --- HTTP API (FastAPI) ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# --- БД и схемы ---
+SQLAlchemy==2.0.36
 pydantic>=2.4.1,<2.10
-python-socks[asyncio]>=2.8.1
-qrcode>=8.2
-websockets>=16.0
 
-# --- dotenv loader для run_poc.py ---
-python-dotenv>=1.0.1
+# --- HTTP-клиент (бот↔API, max↔API) ---
+httpx==0.28.1
+
+# --- Multipart для /sessions/upload (UploadFile в FastAPI) ---
+python-multipart==0.0.9

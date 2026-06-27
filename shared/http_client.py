@@ -11,6 +11,8 @@ from typing import Optional
 
 import httpx
 
+from shared.http_client_chat_ops import ChatOpsHttpMixin
+
 
 def api_base_url() -> str:
     # В монолитном деплое (например, Railway) все процессы крутятся в одном
@@ -20,8 +22,8 @@ def api_base_url() -> str:
     return f"http://{host}:{port}"
 
 
-class ApiClient:
-    """Тонкая обёртка над httpx."""
+class ApiClient(ChatOpsHttpMixin):
+    """Тонкая обёртка над httpx + chat-ops mixin (``/chat_ops/...``)."""
 
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
         self.base_url = base_url or api_base_url()

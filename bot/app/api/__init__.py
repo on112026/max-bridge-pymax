@@ -15,6 +15,10 @@
 * ``topics``   — ``claim_topic_jobs`` / ``finish_topic_job`` /
                  ``topic_jobs_stats`` / ``list_stale_topics`` /
                  ``close_stale_topic``.
+* ``chat_ops`` — ``join_chat`` / ``resolve_chat`` / ``invite_to_chat`` /
+                 ``list_join_requests`` / ``confirm_join_requests`` /
+                 ``decline_join_requests`` / ``search_user_by_phone`` /
+                 ``wait_chat_op`` / ``get_chat_op`` / ``chat_op_stats``.
 
 ``bot/app/api_client.py`` — тонкая публичная обёртка, реэкспортирует
 ``BotApi`` для обратной совместимости со старым кодом (``from app.api_client import api``).
@@ -22,6 +26,7 @@
 
 from shared.http_client import ApiClient
 from app.api.auth import AuthApiMixin
+from app.api.chat_ops import ChatOpsApiMixin
 from app.api.chats import ChatsApiMixin
 from app.api.core import BotApi
 from app.api.events import EventsApiMixin
@@ -38,6 +43,7 @@ class BotApiComposite(
     AuthApiMixin,
     SessionsApiMixin,
     TopicsApiMixin,
+    ChatOpsApiMixin,
 ):
     """Финальный ``BotApi`` со всеми методами из миксинов.
 
