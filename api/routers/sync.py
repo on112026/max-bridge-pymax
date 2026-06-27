@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Depends
 
@@ -89,6 +90,42 @@ def internal_sync_topics(body: SyncTopicsIn) -> SyncTopicsOut:
             supergroup_chat_id=int(sg.supergroup_chat_id),
         )
         enqueued_total += len(created)
+
+    # 2a) Одноразовая миграция имён топиков после изменения формата
+    # ``(MAX: <id>)`` → ``(<label>: <id>)``. Делается ОДИН раз после
+    # деплоя: для всех существующих топиков ставим ``rename``-джобы,
+    # чтобы воркер перерисовал имена с учётом ``chat_type``. Флаг хранится
+    # в ``system_state`` (``key="topics_v2_migrated"``), переживает рестарт.
+    forced_total = 0
+    with db.session_scope() as s:
+        flag = s.get(db.SystemState, "topics_v2_migrated")
+        already_migrated = bool(
+            flag is not None and str(flag.value or "").strip() in ("1", "true")
+        )
+    if not already_migrated and owners:
+        for sg in owners:
+            forced = db.enqueue_topic_sync_jobs(
+                owner_user_id=int(sg.owner_user_id),
+                chats=list(incoming_by_id.values()),
+                supergroup_chat_id=int(sg.supergroup_chat_id),
+                force_rename=True,
+            )
+            forced_total += len(forced)
+        if forced_total:
+            with db.session_scope() as s:
+                row = s.get(db.SystemState, "topics_v2_migrated")
+                if row is None:
+                    s.add(db.SystemState(key="topics_v2_migrated", value="1"))
+                else:
+                    row.value = "1"
+                    row.updated_at = datetime.utcnow()
+            logger.info(
+                "internal_sync_topics: one-shot v2 migration enqueued "
+                "%d rename jobs (chat_type labels)",
+                forced_total,
+            )
+    enqueued_total += forced_total
+
     stats = db.get_topic_sync_stats()
     by_action["create"] = stats.get("pending_create", 0)
     by_action["rename"] = stats.get("pending_rename", 0)

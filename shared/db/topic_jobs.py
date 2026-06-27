@@ -38,6 +38,7 @@ def enqueue_topic_sync_jobs(
     owner_user_id: int,
     chats: List[dict],
     supergroup_chat_id: int,
+    force_rename: bool = False,
 ) -> List[int]:
     """Положить пачку задач ``create``/``rename`` в ``topic_sync_jobs``.
 
@@ -47,6 +48,15 @@ def enqueue_topic_sync_jobs(
 
     * если топика ещё нет в ``chat_topics`` → ``action="create"``;
     * если топик есть и ``title`` поменялся → ``action="rename"``.
+
+    ``force_rename=True`` — режим одноразовой миграции: для **всех**
+    существующих топиков поставить ``action="rename"`` (даже если
+    ``title`` не менялся). Используется из ``api/routers/sync.py`` после
+    изменения формата имени топика (``(MAX: <id>)`` → ``(<label>: <id>)``),
+    чтобы воркер перерисовал уже существующие топики. Вызывающий код
+    обязан сам следить за тем, чтобы вызов был **один раз** (например,
+    через флаг в ``system_state``), иначе на каждом ``auth_ok`` будут
+    плодиться лишние джобы.
 
     Возвращает список id созданных джобов. Если у владельца ещё нет
     supergroup (``supergroup_chat_id is None``) — возвращает ``[]``.
@@ -83,6 +93,10 @@ def enqueue_topic_sync_jobs(
             existing_topic = existing_topics.get(cid)
             if existing_topic is None:
                 action = "create"
+            elif force_rename:
+                # Разовая миграция: переименовать ВСЕ существующие топики,
+                # чтобы воркер перерисовал имя с учётом chat_type.
+                action = "rename"
             else:
                 # Сравниваем сохранённое имя с новым (с trim'ом).
                 old = (existing_topic.topic_name or "").strip()
