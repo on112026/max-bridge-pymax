@@ -25,8 +25,9 @@ import io
 import logging
 import os
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -101,6 +102,10 @@ async def help_command(message: types.Message) -> None:
         "/chats — список MAX-чатов\n"
         "/reply <chat_id> — следующее сообщение уйдёт в этот чат\n"
         "/history <chat_id> [N=20] — последние N сообщений\n"
+        "/setup — инструкция по подключению supergroup\n"
+        "/autosetup — вызвать в группе: бот сам определит chat_id и привяжет её\n"
+        "/setgroup <chat_id> — ручное подключение supergroup по её id\n"
+        "/getlink — получить invite-ссылку на привязанную группу\n"
         "/reauth_sms — войти в MAX через SMS/2FA (отправит код в MAX)\n"
         "/upload_session — загрузить файл сессии MAX (bridge.db)\n"
         "/code <число> — ввести SMS-код или 2FA-пароль для текущего запроса\n"
@@ -412,7 +417,7 @@ async def upload_session_command(message: types.Message, state: FSMContext) -> N
     await button_upload_session(message, state)
 
 
-# ---------- /setup — создание приватной Telegram-группы для моста ----------
+# ---------- /setup — инструкция по созданию приватной Telegram-группы для моста ----------
 
 
 async def setup_command(message: types.Message) -> None:
@@ -422,7 +427,9 @@ async def setup_command(message: types.Message) -> None:
     напрямую. Это всегда делается либо через клиентский MTProto (TDesktop,
     Telegram для Android/iOS), либо вручную в любом клиенте Telegram. После
     того как supergroup создана и бот добавлен в неё как админ, владелец
-    присылает сюда ``chat_id`` через ``/setgroup <chat_id>``.
+    может либо вызвать ``/autosetup`` прямо в этой группе (бот сам найдёт
+    ``chat_id`` и проверит все требования), либо прислать ``chat_id`` сюда
+    через ``/setgroup <chat_id>``.
 
     Поведение:
     * Если supergroup уже привязана — присылает её текущий ``invite_link``
@@ -455,24 +462,242 @@ async def setup_command(message: types.Message) -> None:
         "2. <b>Включите топики</b>: Настройки группы → «Топики» (Topics).\n"
         "3. Добавьте этого бота в группу и сделайте <b>админом</b> "
         "(с правом «Управление топиками»).\n"
-        "4. Узнайте <code>chat_id</code> группы. Проще всего: "
-        "перешлите любое сообщение из группы боту @RawDataBot — "
-        "в ответе будет поле <code>forward_from_chat.id</code> "
-        "(формат <code>-100xxxxxxxxxx</code>).\n"
-        "5. Вернитесь сюда и выполните:\n"
-        "   <code>/setgroup <chat_id></code>\n\n"
-        "После этого бот начнёт пересылать события из MAX в эту группу "
-        "(каждый MAX-чат получит свой топик)."
+        "4. <b>Внутри созданной группы</b> выполните:\n"
+        "   <code>/autosetup</code>\n"
+        "   Бот сам определит <code>chat_id</code> группы, проверит все "
+        "требования и привяжет её к мосту. Если что-то не так — пришлёт "
+        "в личку подробный чеклист, что доделать вручную.\n\n"
+        "<i>Альтернатива (ручной режим):</i> узнайте <code>chat_id</code> "
+        "через @RawDataBot и выполните в личке <code>/setgroup <chat_id></code>.\n\n"
+        "После успешного подключения бот начнёт пересылать события из MAX "
+        "в эту группу (каждый MAX-чат получит свой топик)."
     )
 
 
+# ---------- Общая логика привязки supergroup (helper) ----------
+#
+# Используется и в ``/setgroup <chat_id>`` (ручной ввод), и в ``/autosetup``
+# (вызов внутри группы, когда ``chat_id`` берётся из ``message.chat.id``).
+# Возвращает структурированный результат, чтобы вызывающий код мог
+# отправить владельцу подробное сообщение об успехе или об отказе.
+
+
+@dataclass
+class AttachResult:
+    """Результат ``_attach_supergroup_for_owner``.
+
+    ``ok=True`` означает, что все проверки пройдены и запись в БД создана.
+    В этом случае ``details`` содержит ``title``/``invite_link``/``forum_ok``.
+
+    Если ``ok=False``, ``short_error`` — короткое описание причины отказа
+    (одна строка, для отправки в группу), а ``details`` — словарь с
+    подробностями по каждой проверке (для детального сообщения в личку).
+    """
+
+    ok: bool
+    short_error: str = ""
+    details: Dict[str, Any] = None
+
+    def __post_init__(self) -> None:
+        if self.details is None:
+            self.details = {}
+
+
+async def _attach_supergroup_for_owner(
+    bot: Bot,
+    chat_id: int,
+    owner_uid: int,
+) -> AttachResult:
+    """Проверить требования к supergroup и привязать её к ``owner_uid``.
+
+    Шаги (выполняются последовательно, на первой же ошибке — отказ):
+
+    1. ``bot.get_chat(chat_id)`` — бот вообще видит этот чат.
+    2. Тип чата — ``supergroup`` (или ``group``, что эквивалентно в Bot API).
+    3. ``bot.get_chat_member(chat_id, bot.id)`` — бот ``administrator`` или
+       ``creator`` (нужны права на создание топиков).
+    4. ``ensure_forum_enabled`` — топики включены (``chat.is_forum``).
+    5. ``export_invite_link`` — получаем/создаём invite-ссылку.
+    6. ``shared_db.create_supergroup(...)`` — финальная запись в БД.
+
+    При успехе возвращает ``AttachResult(ok=True, details=...)``.
+    При отказе — ``AttachResult(ok=False, short_error="...", details=...)``
+    и **не пишет в БД**.
+    """
+    details: Dict[str, Any] = {"chat_id": chat_id}
+
+    # 1) Бот должен видеть чат (быть добавленным).
+    try:
+        chat = await bot.get_chat(chat_id)
+    except Exception as exc:
+        logger.warning(
+            "_attach_supergroup_for_owner: get_chat(%s) failed: %s", chat_id, exc
+        )
+        return AttachResult(
+            ok=False,
+            short_error="бот не состоит в этой группе или чат недоступен",
+            details={**details, "stage": "get_chat", "error": str(exc)},
+        )
+
+    chat_type = str(getattr(chat, "type", "") or "")
+    details["chat_type"] = chat_type
+    details["title"] = getattr(chat, "title", None) or ""
+    if "group" not in chat_type.lower():
+        return AttachResult(
+            ok=False,
+            short_error=f"чат имеет тип «{chat_type}», нужен supergroup",
+            details={**details, "stage": "chat_type"},
+        )
+
+    # 2) Бот должен быть админом.
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        status = str(getattr(member, "status", "") or "")
+    except Exception as exc:
+        logger.warning(
+            "_attach_supergroup_for_owner: get_chat_member(%s) failed: %s",
+            chat_id, exc,
+        )
+        return AttachResult(
+            ok=False,
+            short_error="не удалось проверить права бота в группе",
+            details={**details, "stage": "get_chat_member", "error": str(exc)},
+        )
+    details["bot_status"] = status
+    if status not in ("ChatMemberStatus.ADMINISTRATOR", "administrator", "creator"):
+        return AttachResult(
+            ok=False,
+            short_error="бот не админ в группе",
+            details={**details, "stage": "bot_not_admin"},
+        )
+
+    # 3) Топики должны быть включены.
+    forum_ok = await ensure_forum_enabled(bot, chat_id)
+    details["forum_ok"] = forum_ok
+    if not forum_ok:
+        return AttachResult(
+            ok=False,
+            short_error="топики (forum) не включены в группе",
+            details={**details, "stage": "forum_disabled"},
+        )
+
+    # 4) Invite-ссылка.
+    invite_link = await export_invite_link(bot, chat_id)
+    details["invite_link"] = invite_link
+
+    # 5) Финальная запись в БД.
+    title = getattr(chat, "title", None) or "MAX Bridge 🔒"
+    try:
+        shared_db.create_supergroup(
+            owner_user_id=owner_uid,
+            supergroup_chat_id=chat_id,
+            title=title,
+            invite_link=invite_link,
+            is_forum_enabled=forum_ok,
+        )
+    except Exception as exc:
+        logger.exception(
+            "_attach_supergroup_for_owner: shared_db.create_supergroup failed for %s",
+            chat_id,
+        )
+        return AttachResult(
+            ok=False,
+            short_error="ошибка записи в БД",
+            details={**details, "stage": "db_create", "error": str(exc)},
+        )
+
+    # 6) Сбросить флаг «уже подсказали про /setup» в AuthWatcher.
+    w = AuthWatcher.get_active()
+    if w is not None:
+        try:
+            w._supergroup_prompted_for.discard(owner_uid)
+        except Exception as exc:
+            logger.debug("attach: reset prompt flag failed: %s", exc)
+
+    details["title"] = title
+    details["invite_link"] = invite_link
+    details["forum_ok"] = forum_ok
+    return AttachResult(ok=True, details=details)
+
+
+def _format_attach_failure_for_owner(result: AttachResult) -> str:
+    """Подробное сообщение для владельца (в личку) при отказе привязки.
+
+    Перечисляет, какие проверки прошли, какие — нет, и что доделать
+    вручную.
+    """
+    d = result.details or {}
+    lines: list[str] = [
+        f"⚠️ Не удалось подключить группу <code>{d.get('chat_id')}</code> автоматически.",
+        "",
+    ]
+    chat_type_ok = "group" in str(d.get("chat_type", "")).lower()
+    lines.append(
+        f"• Тип чата: <b>{_escape(str(d.get('chat_type') or '—'))}</b> "
+        f"{'✅' if chat_type_ok else '❌ (нужен supergroup)'}"
+    )
+    bot_status = str(d.get("bot_status") or "—")
+    bot_status_ok = bot_status in (
+        "ChatMemberStatus.ADMINISTRATOR", "administrator", "creator",
+    )
+    lines.append(
+        f"• Бот — админ: <b>{_escape(bot_status)}</b> "
+        f"{'✅' if bot_status_ok else '❌'}"
+    )
+    if "forum_ok" in d:
+        lines.append(
+            f"• Топики (forum): {'включены ✅' if d.get('forum_ok') else '❌ выключены'}"
+        )
+
+    stage = str(d.get("stage") or "")
+    if stage == "get_chat":
+        lines.append("")
+        lines.append(
+            "Бот не состоит в этой группе или чат недоступен. "
+            "Сначала добавьте бота в группу."
+        )
+    elif stage == "bot_not_admin":
+        lines.append("")
+        lines.append(
+            "Что сделать:\n"
+            "1. Откройте группу → Управление → Администраторы.\n"
+            "2. Добавьте бота с правом <b>«Manage Topics»</b>.\n"
+            "3. Повторите <code>/autosetup</code> в группе."
+        )
+    elif stage == "forum_disabled":
+        lines.append("")
+        lines.append(
+            "Что сделать:\n"
+            "1. Откройте группу → Настройки группы → <b>Топики</b>.\n"
+            "2. Включите «Топики».\n"
+            "3. Повторите <code>/autosetup</code> в группе."
+        )
+    elif stage == "db_create":
+        lines.append("")
+        lines.append(
+            f"Ошибка записи в БД: <code>{_escape(str(d.get('error') or '—'))}</code>"
+        )
+    elif d.get("error"):
+        lines.append("")
+        lines.append(
+            f"Техническая ошибка: <code>{_escape(str(d.get('error') or '—'))}</code>"
+        )
+
+    return "\n".join(lines)
+
+
 async def setgroup_command(message: types.Message) -> None:
-    """Привязать существующую supergroup (forum) к владельцу.
+    """Привязать существующую supergroup (forum) к владельцу (ручной режим).
 
     Использование: <code>/setgroup <chat_id></code>, где ``chat_id``
     имеет формат <code>-100xxxxxxxxxx</code>. Бот проверит, что он
     находится в группе и может создавать топики, после чего сохранит
     привязку в БД. EventPoller сразу подхватит накопившиеся события.
+
+    Эта команда — «ручной» аналог ``/autosetup``: пользователь сам
+    вводит ``chat_id`` (например, узнал через @RawDataBot). Реальная
+    валидация и привязка делегированы в ``_attach_supergroup_for_owner``.
     """
     if not _is_allowed(message.from_user.id):
         return await _reject(message)
@@ -482,7 +707,9 @@ async def setgroup_command(message: types.Message) -> None:
         await message.answer(
             "Использование: <code>/setgroup <chat_id></code>\n"
             "Формат <code>chat_id</code>: <code>-100xxxxxxxxxx</code> "
-            "(можно узнать через @RawDataBot)."
+            "(можно узнать через @RawDataBot).\n\n"
+            "<i>Совет:</i> проще вызвать <code>/autosetup</code> прямо "
+            "внутри группы — бот сам определит <code>chat_id</code>."
         )
         return
 
@@ -492,74 +719,31 @@ async def setgroup_command(message: types.Message) -> None:
         await message.answer("⚠️ chat_id должен быть числом (формат -100xxxxxxxxxx).")
         return
 
-    # Проверим, что бот действительно состоит в этой группе и видит её.
-    try:
-        chat = await message.bot.get_chat(chat_id)
-    except Exception as exc:
-        await message.answer(
-            f"⚠️ Не удалось получить чат <code>{chat_id}</code>: {_escape(str(exc))}\n"
-            "Убедитесь, что бот добавлен в группу и имеет права админа."
-        )
-        return
-
-    chat_type = getattr(chat, "type", None)
-    if chat_type and "group" not in str(chat_type).lower():
-        await message.answer(
-            f"⚠️ Чат <code>{chat_id}</code> имеет тип <b>{_escape(str(chat_type))}</b>, "
-            "а нужен supergroup с включёнными топиками."
-        )
-        return
-
-    # Проверим, что бот — админ (нужны права на создание топиков).
-    try:
-        member = await message.bot.get_chat_member(chat_id, (await message.bot.get_me()).id)
-        status = getattr(member, "status", None)
-        if str(status) not in ("ChatMemberStatus.ADMINISTRATOR", "administrator", "creator"):
-            await message.answer(
-                "⚠️ Бот должен быть <b>админом</b> группы (с правом «Manage Topics»). "
-                "Сделайте бота админом и попробуйте /setgroup ещё раз."
-            )
-            return
-    except Exception as exc:
-        logger.warning("setgroup: get_chat_member failed for %s: %s", chat_id, exc)
-        await message.answer(
-            f"⚠️ Не удалось проверить права бота в группе: {_escape(str(exc))}"
-        )
-        return
-
-    # Включим forum mode (если ещё не включён).
-    forum_ok = await ensure_forum_enabled(message.bot, chat_id)
-    if not forum_ok:
-        await message.answer(
-            "⚠️ Не удалось включить топики автоматически. Включите их вручную:\n"
-            "Настройки группы → Топики → Включить. Затем повторите /setgroup."
-        )
-        # Сохраняем всё равно, чтобы владелец мог доделать настройки и вернуться.
-        # Если топики не включены — EventPoller будет падать, но данные сохранятся.
-
-    # Получаем/создаём invite link.
-    invite_link = await export_invite_link(message.bot, chat_id)
-
-    title = getattr(chat, "title", None) or "MAX Bridge 🔒"
-
-    shared_db.create_supergroup(
-        owner_user_id=message.from_user.id,
-        supergroup_chat_id=chat_id,
-        title=title,
-        invite_link=invite_link,
-        is_forum_enabled=forum_ok,
+    result = await _attach_supergroup_for_owner(
+        bot=message.bot,
+        chat_id=chat_id,
+        owner_uid=message.from_user.id,
     )
 
-    # Сбрасываем флаг «уже подсказали про /setup» в AuthWatcher (если он
-    # запущен в этом процессе). Чтобы при следующем всплеске undelivered
-    # снова получить подсказку, если группу позже удалят.
-    w = AuthWatcher.get_active()
-    if w is not None:
-        try:
-            w._supergroup_prompted_for.discard(message.from_user.id)
-        except Exception as exc:
-            logger.debug("setgroup: reset prompt flag failed: %s", exc)
+    if not result.ok:
+        logger.info(
+            "setgroup_command: REFUSED chat_id=%s reason=%s",
+            chat_id, result.short_error,
+        )
+        await message.answer(
+            f"⚠️ Не удалось привязать группу: {result.short_error}."
+        )
+        await message.answer(
+            _format_attach_failure_for_owner(result),
+            parse_mode="HTML",
+        )
+        return
 
+    # Успех.
+    details = result.details or {}
+    title = str(details.get("title") or "MAX Bridge 🔒")
+    forum_ok = bool(details.get("forum_ok"))
+    invite_link = details.get("invite_link")
     await message.answer(
         f"✅ Supergroup подключена!\n\n"
         f"Название: <b>{_escape(title)}</b>\n"
@@ -584,6 +768,126 @@ async def setgroup_command(message: types.Message) -> None:
             )
     except Exception as exc:
         logger.debug("setgroup: status check failed: %s", exc)
+
+
+async def autosetup_command(message: types.Message) -> None:
+    """Автоматически привязать группу к владельцу.
+
+    Вызывается **внутри** той группы, которую нужно подключить.
+    ``chat_id`` берётся прямо из ``message.chat.id`` — самый надёжный
+    способ (никаких форвардов, никаких внешних утилит).
+
+    Поведение:
+    * Если команда вызвана **вне группы** (в личке) — просим вызвать
+      команду прямо в группе.
+    * Если команда вызвана **в группе**, но это **не supergroup** —
+      отказываем с понятным сообщением.
+    * Если бот — **не админ** или топики **выключены** — в группу шлём
+      короткое сообщение с причиной отказа, в личку владельцу — детальный
+      чеклист (через ``_format_attach_failure_for_owner``).
+    * Если всё ОК — пишем в БД, шлём подтверждение и в группу, и в личку.
+    """
+    if not message.from_user or not _is_allowed(message.from_user.id):
+        return await _reject(message)
+
+    chat = message.chat
+    chat_type = str(getattr(chat, "type", "") or "")
+    if chat_type not in ("supergroup", "group"):
+        await message.answer(
+            "ℹ️ Команду <code>/autosetup</code> нужно вызвать "
+            "<b>внутри группы</b>, которую хотите подключить к мосту.\n"
+            "Откройте нужную группу → в поле сообщения наберите "
+            "<code>/autosetup</code> и отправьте.",
+            parse_mode="HTML",
+        )
+        return
+
+    chat_id = int(chat.id)
+    owner_uid = int(message.from_user.id)
+    logger.info(
+        "autosetup_command: uid=%s chat_id=%s chat_type=%s",
+        owner_uid, chat_id, chat_type,
+    )
+
+    result = await _attach_supergroup_for_owner(
+        bot=message.bot,
+        chat_id=chat_id,
+        owner_uid=owner_uid,
+    )
+
+    if not result.ok:
+        logger.info(
+            "autosetup_command: REFUSED chat_id=%s reason=%s",
+            chat_id, result.short_error,
+        )
+        # В группу — короткое сообщение с причиной отказа.
+        try:
+            await message.answer(
+                f"⚠️ Не удалось подключить эту группу автоматически: "
+                f"{result.short_error}.\n"
+                "Детали и чеклист прислал вам в личку."
+            )
+        except Exception as exc:
+            logger.debug("autosetup: failed to reply in group: %s", exc)
+        # В личку владельцу — подробный разбор.
+        try:
+            await message.bot.send_message(
+                owner_uid,
+                _format_attach_failure_for_owner(result),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("autosetup: failed to DM owner: %s", exc)
+        return
+
+    # Успех.
+    details = result.details or {}
+    title = str(details.get("title") or "MAX Bridge 🔒")
+    invite_link = details.get("invite_link")
+    logger.info(
+        "autosetup_command: SUCCESS chat_id=%s title=%r",
+        chat_id, title,
+    )
+    # В группу — короткое подтверждение.
+    try:
+        await message.answer(
+            f"✅ Supergroup «<b>{_escape(title)}</b>» подключена к мосту MAX↔Telegram!\n"
+            "События MAX будут приходить в топики этой группы "
+            "(каждый MAX-чат — свой топик).",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.debug("autosetup: failed to reply in group: %s", exc)
+    # В личку владельцу — развёрнуто.
+    try:
+        await message.bot.send_message(
+            owner_uid,
+            f"✅ Supergroup подключена автоматически!\n\n"
+            f"Название: <b>{_escape(title)}</b>\n"
+            f"chat_id: <code>{chat_id}</code>\n"
+            f"Топики (forum): включены ✅\n"
+            f"🔗 Invite: {invite_link or '(сгенерируйте вручную через /getlink)'}\n\n"
+            "Бот начнёт пересылать события из MAX в топики этой группы. "
+            "Уже накопленные события будут доставлены автоматически в течение "
+            "пары секунд.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.warning("autosetup: failed to DM owner: %s", exc)
+
+    # Сообщим о накопленных undelivered (как в setgroup_command).
+    try:
+        s = await api.status()
+        undelivered = s.get("undelivered", 0)
+        if undelivered:
+            await message.bot.send_message(
+                owner_uid,
+                f"📬 Сейчас в очереди <b>{undelivered}</b> непрочитанных событий — "
+                "через пару секунд они появятся в группе в своих топиках.",
+                parse_mode="HTML",
+            )
+    except Exception as exc:
+        logger.debug("autosetup: status check failed: %s", exc)
 
 
 async def getlink_command(message: types.Message) -> None:
@@ -816,7 +1120,7 @@ async def upload_session_file_handler(message: types.Message, state: FSMContext)
 # ---------- Inline callbacks: event-action (reply/showid/history) + auth-action ----------
 
 
-async def _resolve_event_chat_id(event_id: int) -> tuple[Optional[str], Optional[Message]]:
+async def _resolve_event_chat_id(event_id: int) -> tuple[Optional[str], Optional[types.Message]]:
     """Достаёт ``max_chat_id`` события из БД через ``api.get_event``.
 
     Возвращает ``(chat_id, alert_message)``. Если что-то пошло не так,
@@ -830,17 +1134,17 @@ async def _resolve_event_chat_id(event_id: int) -> tuple[Optional[str], Optional
             "api.get_event MISSING (api_client.py без этого метода)",
             exc_info=True,
         )
-        return None, "⚠️ api_client.py без метода get_event — перезапустите контейнер"
+        return None, None
     except Exception as exc:
         logger.error(
             "api.get_event(%s) FAILED: %s", event_id, exc, exc_info=True,
         )
-        return None, f"⚠️ API: {exc}"
+        return None, None
     if not ev:
-        return None, "⚠️ событие не найдено"
+        return None, None
     chat_id = ev.get("max_chat_id") or ""
     if not chat_id:
-        return None, "⚠️ пустой chat_id"
+        return None, None
     return chat_id, None
 
 
@@ -887,13 +1191,9 @@ async def event_action_callback(
         "event_action_callback: action=%s event_id=%s", action, event_id,
     )
 
-    chat_id, err = await _resolve_event_chat_id(event_id)
-    if err or not chat_id:
-        logger.warning(
-            "event_action_callback: cannot resolve chat_id for event_id=%s: %s",
-            event_id, err,
-        )
-        return await callback.answer(err or "⚠️ ошибка", show_alert=True)
+    chat_id, _err = await _resolve_event_chat_id(event_id)
+    if not chat_id:
+        return await callback.answer("⚠️ ошибка", show_alert=True)
 
     if action == "reply":
         await state.set_state(ReplyState.waiting_text)
@@ -1332,8 +1632,8 @@ async def auth_action_callback(
 
 
 # Module-level реестр текущего ``AuthWatcher`` (один на процесс).
-# Нужен, чтобы ``setgroup_command`` мог сбросить флаг подсказки
-# «сделай /setup» при успешной привязке supergroup. Ключ — id,
+# Нужен, чтобы ``_attach_supergroup_for_owner`` мог сбросить флаг
+# подсказки «сделай /setup» при успешной привязке supergroup. Ключ — id,
 # чтобы можно было держать несколько watcher'ов в тестах.
 _active_auth_watcher: "dict[int, AuthWatcher]" = {}
 
@@ -1367,7 +1667,7 @@ class AuthWatcher:
         # Множество owner_uid, для которых УЖЕ отправляли подсказку
         # «есть undelivered, но supergroup не подключена — сделай /setup».
         # Чтобы не спамить на каждом тике (3 секунды). Сбрасывается,
-        # когда владелец успешно делает /setgroup.
+        # когда владелец успешно делает /setgroup или /autosetup.
         self._supergroup_prompted_for: set[int] = set()
 
     async def _notify_owner(self, text: str, reply_markup=None) -> None:
@@ -1554,7 +1854,7 @@ class AuthWatcher:
         #    непрочитанные события из MAX, но владелец не подключил
         #    supergroup для пересылки — напоминаем один раз. Чтобы не
         #    спамить на каждом тике, держим set owner_uid, которым уже
-        #    отправили подсказку. Setgroup_command сбрасывает флаг.
+        #    отправили подсказку. Setgroup / autosetup сбрасывают флаг.
         if status == "ok":
             undelivered = int(s.get("undelivered") or 0)
             if undelivered > 0:
@@ -1598,7 +1898,7 @@ class AuthWatcher:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="auth-watcher")
             # Регистрируем себя в module-level реестре, чтобы
-            # ``setgroup_command`` мог сбросить флаг подсказки.
+            # ``_attach_supergroup_for_owner`` мог сбросить флаг подсказки.
             _active_auth_watcher[id(self)] = self
 
     async def stop(self) -> None:
@@ -1615,8 +1915,8 @@ class AuthWatcher:
     def get_active() -> "Optional[AuthWatcher]":
         """Возвращает текущий активный watcher (один на процесс) или ``None``.
 
-        Используется ``setgroup_command``, чтобы сбросить флаг «уже
-        подсказали про /setup» после успешной привязки supergroup.
+        Используется ``_attach_supergroup_for_owner``, чтобы сбросить флаг
+        «уже подсказали про /setup» после успешной привязки supergroup.
         """
         if not _active_auth_watcher:
             return None
@@ -1815,6 +2115,7 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(sessions_command, Command("sessions"))
     dp.message.register(setup_command, Command("setup"))
     dp.message.register(setgroup_command, Command("setgroup"))
+    dp.message.register(autosetup_command, Command("autosetup"))
     dp.message.register(getlink_command, Command("getlink"))
     dp.message.register(prune_topics_command, Command("prune_topics"))
 
