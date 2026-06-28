@@ -64,6 +64,7 @@ async def forward_event(
     event: Dict[str, Any],
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     message_thread_id: Optional[int] = None,
+    header_override: Optional[str] = None,
 ) -> Optional[Message]:
     """Переслать событие из MAX в Telegram.
 
@@ -75,10 +76,18 @@ async def forward_event(
 
     ``message_thread_id`` (опционально) — id топика в супергруппе
     (см. ``app/topics.py``). Если задан, сообщение уходит в топик.
+
+    ``header_override`` (опционально) — если передано ``""``, шапка
+    «💬 чат / ↘️ автор · время» не добавляется к тексту/caption
+    (используется в compact-режиме для топиков, см. ``COMPACT_TOPIC_MESSAGES``).
+    По умолчанию (``None``) — шапка формируется через ``_format_header(event)``.
     """
     kind = (event.get("kind") or "text").lower()
     media_path = event.get("media_path")
-    header = _format_header(event)
+    if header_override is None:
+        header = _format_header(event)
+    else:
+        header = header_override
 
     if not media_path:
         return await bot.send_message(

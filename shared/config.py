@@ -35,6 +35,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = _env(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     val = _env(name)
     if not val:
@@ -64,6 +71,11 @@ class Settings:
     pymax_log_level: str = "INFO"
     pymax_reconnect_delay: float = 2.0
 
+    # Форматирование MAX → Telegram в топиках supergroup.
+    # По умолчанию OFF (старое поведение: шапка + inline-кнопки),
+    # чтобы включить упрощённый режим — выставьте COMPACT_TOPIC_MESSAGES=true.
+    compact_topic_messages: bool = False
+
 
 def load_settings() -> Settings:
     """Загружает настройки и применяет безопасные дефолты."""
@@ -92,4 +104,5 @@ def load_settings() -> Settings:
         log_level=_env("LOG_LEVEL", "INFO") or "INFO",
         pymax_log_level=_env("PYMAX_LOG_LEVEL", "INFO") or "INFO",
         pymax_reconnect_delay=_env_float("PYMAX_RECONNECT_DELAY", 2.0),
+        compact_topic_messages=_env_bool("COMPACT_TOPIC_MESSAGES", False),
     )

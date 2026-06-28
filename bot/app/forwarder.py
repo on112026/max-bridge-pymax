@@ -17,8 +17,10 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from aiogram import Bot
+from aiogram.methods import SetMessageReaction
 
 from app.api_client import api
+from app.config import settings
 from app.keyboards import event_inline_keyboard
 from app.sender import forward_event
 from app.topics import get_or_create_topic
@@ -44,6 +46,10 @@ class EventPoller:
         # Запоминаем supergroup_chat_id после первого успешного lookup-а,
         # чтобы не лезть в БД на каждом тике.
         self._supergroup_chat_id: Optional[int] = None
+        # ``_compact_topic_messages`` фиксируется при первом тике из
+        # ``settings.compact_topic_messages`` и далее не перечитывается,
+        # чтобы поведение внутри сессии было стабильным.
+        self._compact_topic_messages: Optional[bool] = None
 
     async def start(self) -> None:
         self._stop.clear()
@@ -79,6 +85,37 @@ class EventPoller:
         if sg:
             self._supergroup_chat_id = sg.supergroup_chat_id
         return self._supergroup_chat_id
+
+    def _is_compact(self) -> bool:
+        """Compact-режим оформления сообщений в топиках (``COMPACT_TOPIC_MESSAGES``)."""
+        if self._compact_topic_messages is None:
+            self._compact_topic_messages = bool(
+                getattr(settings, "compact_topic_messages", False)
+            )
+        return self._compact_topic_messages
+
+    async def _mark_incoming_reaction(
+        self,
+        chat_id: int,
+        message_id: int,
+        emoji: str = "📨",
+    ) -> None:
+        """Поставить emoji-реакцию на входящее сообщение из MAX (compact-режим).
+
+        Тихое подтверждение доставки. Если бот не админ с правом reactions
+        или метод недоступен — просто ничего не делаем (как в ``topic_echo.py``).
+        """
+        try:
+            await self.bot(SetMessageReaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[{"type": "emoji", "emoji": emoji}],
+            ))
+        except Exception as exc:
+            logger.debug(
+                "set_reaction (incoming) failed for %s/%s: %s",
+                chat_id, message_id, exc,
+            )
 
     async def _tick(self) -> None:
         events: List[Dict[str, Any]] = await api.list_undelivered(limit=50)
@@ -128,16 +165,32 @@ class EventPoller:
                     )
                     continue  # не помечаем delivered — повторим
 
-                # Inline-клавиатура прикрепляется прямо к сообщению
-                # с самим событием (текст/медиа), а не отдельным
-                # сообщением «—» — иначе кнопки «отваливаются»
-                # от контекста и через 48ч Telegram запрещает на них нажимать.
-                kb = event_inline_keyboard(ev.get("id", 0), max_chat_id)
-                await forward_event(
+                # Compact-режим (COMPACT_TOPIC_MESSAGES=true): в топике
+                # убираем шапку «💬 чат / ↘️ автор · время» (топик уже
+                # несёт контекст) и inline-кнопки (автоэхо в топике и так
+                # работает, история чата лежит в нём, ID не нужен).
+                # Подтверждение доставки — реакцией 📨.
+                if self._is_compact():
+                    kb = None
+                    header: Optional[str] = ""
+                else:
+                    # Inline-клавиатура прикрепляется прямо к сообщению
+                    # с самим событием (текст/медиа), а не отдельным
+                    # сообщением «—» — иначе кнопки «отваливаются»
+                    # от контекста и через 48ч Telegram запрещает на них нажимать.
+                    kb = event_inline_keyboard(ev.get("id", 0), max_chat_id)
+                    header = None  # sender сам вызовет _format_header
+
+                sent = await forward_event(
                     self.bot, sg_chat_id, ev,
                     reply_markup=kb,
                     message_thread_id=thread_id,
+                    header_override=header,
                 )
+                if self._is_compact() and sent is not None:
+                    await self._mark_incoming_reaction(
+                        sg_chat_id, sent.message_id,
+                    )
                 await api.mark_delivered(ev["id"])
             except Exception as exc:
                 logger.warning(
