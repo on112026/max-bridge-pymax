@@ -64,7 +64,8 @@ async def help_command(message: types.Message) -> None:
         "/reauth_sms — войти в MAX через SMS/2FA (отправит код в MAX)\n"
         "/upload_session — загрузить файл сессии MAX (bridge.db)\n"
         "/code <число> — ввести SMS-код или 2FA-пароль для текущего запроса\n"
-        "/cancel — выйти из режима ответа / reauth / upload\n",
+        "/cancel — выйти из режима ответа / reauth / upload\n"
+        "/chatops — управление чатами MAX: /join, /resolve, /invite, /search_user, /pending, /approve, /decline\n",
         reply_markup=main_reply_keyboard(),
     )
 
