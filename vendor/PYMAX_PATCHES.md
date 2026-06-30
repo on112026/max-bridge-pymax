@@ -245,6 +245,52 @@ pymax_patches: Dispatcher.dispatch → NOTIF_CHAT synthesises
 после успешного ``client.send_message`` (capture ``msg.id`` → вызов
 ``shared.db.record_delivered_with_tg``).
 
+## Patch 7: ``User.web_app`` / ``User.menu_button`` — принимаем ``dict`` или ``str``
+
+**Симптом:** ``/search_user <+79...>`` (и любой вызов
+``client.search_by_phone`` / ``add_contact`` / ``fetch_users``) падает
+с::
+
+    pydantic_core._pydantic_core.ValidationError: 1 validation error for User
+    web_app
+      Input should be a valid dictionary [type=dict_type,
+        input_value='https://b2bapi.max.ru/otp-web-app/index.html',
+        input_type=str]
+
+После этого ``pymax.api.response.require_payload_item_model`` бросает
+исключение, ``_cache_user`` не вызывается, ``max/app/chat_ops._do_op``
+получает ``PyMaxError`` → задача ``search_user`` уходит в ``failed``
+и бот показывает владельцу «Не удалось найти пользователя».
+
+**Причина:** в ``pymax/types/domain/user.py::User`` поля объявлены как::
+
+    web_app: dict[str, Any] | None = None
+    menu_button: dict[str, Any] | None = None
+
+MAX-сервер на свежих сессиях авторизации возвращает сюда **строку-URL**
+(``https://b2bapi.max.ru/otp-web-app/index.html``) — это
+**реальный контракт** (видимо, означает «пользователь не подтвердил
+otp-web-app»). Pydantic 2.x в строгом режиме не coerce-ит ``str`` в
+``dict`` → ``ValidationError``.
+
+**Workaround:** правим модель ``User`` (это **vendor**-файл, но
+изменение точечное и идемпотентное — при обновлении субмодуля будет
+потеряно, см. «Когда удалять» ниже)::
+
+    web_app: dict[str, Any] | str | None = None
+    menu_button: dict[str, Any] | str | None = None
+
+Бот (см. ``bot/app/handlers/chat_ops/_common.py::format_user_result``)
+использует ``_first_str(...)``, который одинаково работает и с dict,
+и со str (просто вызывает ``str(v)``), так что downstream-логика
+ломаться не должна.
+
+**Когда удалять:** при обновлении PyMax до версии, где ``User.web_app``
+и ``User.menu_button`` уже объявлены как ``dict | str | None`` (или
+только как ``str | None`` — мы всё равно принимаем обе формы). Тогда
+просто верните старые аннотации в ``pymax/types/domain/user.py``
+(патч-точечный, дифф на 2 строки).
+
 ---
 
 Другие баги добавляйте здесь по мере обнаружения.

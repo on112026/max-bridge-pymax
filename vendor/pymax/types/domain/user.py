@@ -45,9 +45,21 @@ class User(CamelModel):
     :ivar link: Ссылка на профиль.
     :vartype link: str | None
     :ivar web_app: Данные связанного web-приложения, если есть.
-    :vartype web_app: dict[str, Any] | None
+    :vartype web_app: dict[str, Any] | str | None
     :ivar menu_button: Данные кнопки меню профиля, если есть.
-    :vartype menu_button: dict[str, Any] | None
+    :vartype menu_button: dict[str, Any] | str | None
+
+    .. note::
+       ``web_app`` / ``menu_button`` объявлены как ``dict | str | None``
+       (а не чистый ``dict``), потому что MAX на свежих сессиях
+       авторизации возвращает сюда **строку-URL**
+       (``https://b2bapi.max.ru/otp-web-app/index.html``) — это
+       не наша ошибка, а реальный контракт. Без ``| str`` pydantic
+       падает с ``ValidationError: Input should be a valid dictionary
+       [type=dict_type, input_value='...', input_type=str]``, что
+       валит ``search_by_phone`` / ``add_contact`` / ``fetch_users``.
+       Бот (см. ``format_user_result``) использует ``_first_str(...)``,
+       который одинаково работает и с dict, и со str.
     """
 
     id: int
@@ -65,8 +77,8 @@ class User(CamelModel):
     description: str | None = None
     gender: str | None = None
     link: str | None = None
-    web_app: dict[str, Any] | None = None
-    menu_button: dict[str, Any] | None = None
+    web_app: dict[str, Any] | str | None = None
+    menu_button: dict[str, Any] | str | None = None
 
     _actions: UserService | None = PrivateAttr(default=None)
 

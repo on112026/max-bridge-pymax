@@ -93,6 +93,16 @@ class SendQueue(Base):
     # прочитанный (``mark_chat_read_up_to`` уже используется в боте; ниже
     # мы просто дополним thread_id в sender.py).
     thread_id = Column(Integer, nullable=True)
+    # ``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого
+    # ушёл ответ в MAX (``message.message_id`` в aiogram). После успешной
+    # отправки в MAX (``client.send_message`` возвращает ``msg.id``)
+    # MAX-процесс создаёт ``DeliveredMessage``-строку, связывающую
+    # ``(max_chat_id, str(msg.id))`` ↔ ``(tg_chat_id, thread_id,
+    # tg_message_id)``. Нужно для двусторонней синхронизации реакций
+    # MAX→TG на наши же сообщения (мост MAX→TG иначе логирует
+    # «DIALOG-mirror skip, no DeliveredMessage»).
+    tg_chat_id = Column(Integer, nullable=True, index=True)
+    tg_message_id = Column(Integer, nullable=True)
 
 
 class AuthState(Base):
