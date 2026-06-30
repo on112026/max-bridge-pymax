@@ -101,12 +101,23 @@ def register_bridge(client) -> None:
     async def _on_start(client) -> None:
         await on_start_actions(client)
 
-    # Логируем КАЖДЫЙ фрейм, похожий на реакцию — и по opcode (подстрока
-    # "REACT" в имени/строковом представлении), и по содержимому payload
-    # (на случай, если opcode приходит числом/неизвестным, но в payload
-    # есть notif_msg_reactions_changed / notif_msg_you_reacted).
-    # Это нужно, чтобы выяснить, под каким opcode MAX-сервер реально
-    # шлёт события о реакциях, если они не приходят в on_reaction_update.
+    # Логируем КАЖДЫЙ фрейм long-poll — нужно для диагностики источника
+    # обновлений реакций (см. задачу «MAX шлёт реакции как opcode=135, а не
+    # 155/156»). Включается через env ``MAX_BRIDGE_RAW_LOG=all`` (по
+    # умолчанию — оставляем старое поведение, фильтр по «REACT»/reaction,
+    # чтобы не засорять логи). Чтобы не упустить ничего важного, но и не
+    # топить лог PING-ами, opcode 1 (PING) всегда пропускается.
+    import os
+    _raw_log_mode = (os.getenv("MAX_BRIDGE_RAW_LOG", "react") or "react").lower()
+    # Режимы:
+    #   ``off``   — не логировать ничего (полностью выключить трейс).
+    #   ``react`` — старое поведение: только фреймы, похожие на реакции
+    #               (по opcode "REACT" или по подстроке ``reaction`` в payload).
+    #   ``all``   — логировать вообще все inbound-фреймы (кроме PING).
+    #                payload обрезается до ``MAX_BRIDGE_RAW_LOG_MAX`` символов
+    #                (по умолчанию 800), чтобы не раздувать лог.
+    _raw_log_max = int(os.getenv("MAX_BRIDGE_RAW_LOG_MAX", "800"))
+
     def _looks_like_reaction_payload(payload: Any) -> bool:
         if payload is None:
             return False
@@ -120,25 +131,61 @@ def register_bridge(client) -> None:
             or "notif_msg_you_reacted" in text
         )
 
+    def _opcode_name(opcode: Any) -> str:
+        """Превратить числовой opcode в имя ``Opcode.<NAME>`` (если есть)."""
+        if opcode is None:
+            return "?"
+        try:
+            from pymax.protocol import Opcode
+            for member in Opcode:
+                if int(member.value) == int(opcode):
+                    return f"Opcode.{member.name}(={opcode})"
+        except Exception:
+            pass
+        return str(opcode)
+
     @client.on_raw()
     async def _on_raw_reaction_trace(frame: InboundFrame, client) -> None:
         opcode = getattr(frame, "opcode", None)
+        # PING (1) и пустые фреймы пропускаем в любом режиме — это шум.
+        if opcode in (None, 1):
+            return
         op_str = str(opcode).upper() if opcode is not None else ""
-        if "REACT" not in op_str and not _looks_like_reaction_payload(
-            getattr(frame, "payload", None)
-        ):
+        is_react_related = (
+            "REACT" in op_str
+            or _looks_like_reaction_payload(getattr(frame, "payload", None))
+        )
+        if _raw_log_mode == "off":
+            return
+        if _raw_log_mode == "react" and not is_react_related:
             return
         try:
-            payload_repr = repr(frame.payload) if frame.payload else "None"
+            payload_repr = (
+                repr(frame.payload) if frame.payload else "None"
+            )
+            if len(payload_repr) > _raw_log_max:
+                payload_repr = payload_repr[:_raw_log_max] + "...<truncated>"
         except Exception as exc:
             payload_repr = f"<unreprable: {exc}>"
-        logger.info(
-            "raw.reaction frame: opcode=%s cmd=%s seq=%s payload=%s",
-            opcode,
-            getattr(frame, "cmd", "?"),
-            getattr(frame, "seq", "?"),
-            payload_repr,
-        )
+        op_name = _opcode_name(opcode)
+        if is_react_related:
+            logger.info(
+                "raw.reaction frame: opcode=%s(%s) cmd=%s seq=%s payload=%s",
+                opcode,
+                op_name,
+                getattr(frame, "cmd", "?"),
+                getattr(frame, "seq", "?"),
+                payload_repr,
+            )
+        else:
+            logger.info(
+                "raw.all frame: opcode=%s(%s) cmd=%s seq=%s payload=%s",
+                opcode,
+                op_name,
+                getattr(frame, "cmd", "?"),
+                getattr(frame, "seq", "?"),
+                payload_repr,
+            )
 
     # Факт регистрации хендлеров — для отладки.
     try:
