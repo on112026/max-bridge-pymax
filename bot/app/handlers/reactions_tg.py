@@ -87,33 +87,10 @@ def _is_our_supergroup(chat_id: int) -> bool:
     return bool(sg) and sg.supergroup_chat_id == chat_id
 
 
-def _enqueue_op(
-    op: str,
-    max_chat_id: str,
-    max_message_id: str,
-    emoji: str,
-) -> None:
-    """Положить задачу в ``reaction_ops_queue`` через BotApi."""
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        coro = api.enqueue_reaction_op_to_max(
-            op=op,
-            max_chat_id=max_chat_id,
-            max_message_id=max_message_id,
-            emoji=emoji,
-        )
-        if loop.is_running():
-            # Этот код вызывается из синхронного хэндлера, но мы
-            # внутри aiogram (async) контекста — используем
-            # ``asyncio.ensure_future``.
-            asyncio.ensure_future(coro)
-        else:
-            loop.run_until_complete(coro)
-    except Exception as exc:
-        logger.warning(
-            "reactions_tg: enqueue_reaction_op_to_max failed: %s", exc,
-        )
+def _enqueue_op(*args, **kwargs):  # pragma: no cover - удалено
+    raise NotImplementedError(
+        "_enqueue_op удалён: используйте await api.enqueue_reaction_op_to_max(...)"
+    )
 
 
 async def _process_reaction_change(

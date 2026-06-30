@@ -36,6 +36,49 @@ class ApiClient(ChatOpsHttpMixin):
     def _headers(self) -> dict:
         return {"X-Api-Key": self.api_key}
 
+    async def post(
+        self,
+        path: str,
+        json: dict | None = None,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ) -> dict:
+        """Универсальный POST для произвольных эндпоинтов.
+
+        ``headers`` мерджатся с базовыми (``X-Api-Key``); свои
+        перезаписывают дефолтные. Возвращает JSON-ответ (или ``{}``
+        для пустого тела).
+        """
+        merged_headers = {**self._headers(), **(headers or {})}
+        r = await self._client.post(
+            path,
+            json=json or {},
+            params=params or {},
+            headers=merged_headers,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {}
+
+    async def get(
+        self,
+        path: str,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ) -> list | dict:
+        """Универсальный GET для произвольных эндпоинтов.
+
+        Возвращает JSON (как ``dict`` или ``list``) или ``[]`` для
+        пустого тела.
+        """
+        merged_headers = {**self._headers(), **(headers or {})}
+        r = await self._client.get(
+            path,
+            params=params or {},
+            headers=merged_headers,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else []
+
     async def post_event(self, event: dict) -> dict:
         r = await self._client.post("/events", json=event, headers=self._headers())
         r.raise_for_status()
