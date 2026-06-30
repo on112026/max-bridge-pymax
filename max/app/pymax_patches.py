@@ -66,10 +66,11 @@ def apply() -> None:
         return
     _patch_reaction_message_id_int()
     _patch_event_map_you_reacted()
+    _patch_reaction_event_message_id_coerce()
     _APPLIED = True
     logger.info(
-        "pymax_patches.apply: applied (reaction message_id → int, "
-        "EVENT_MAP[NOTIF_MSG_YOU_REACTED] → REACTION_UPDATE)",
+        "pymax_patches.apply: applied (out msgId→int, in EVENT_MAP[YOU_REACTED], "
+        "in ReactionUpdateEvent.messageId coerce int→str)",
     )
 
 
@@ -216,4 +217,73 @@ def _patch_event_map_you_reacted() -> None:
     logger.info(
         "pymax_patches: EVENT_MAP[NOTIF_MSG_YOU_REACTED] → "
         "resolve_reaction_update (registered)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patch 3: ReactionUpdateEvent.model_validate → coerce messageId int→str
+# ---------------------------------------------------------------------------
+
+
+def _patch_reaction_event_message_id_coerce() -> None:
+    """PyMax 2.2.0: ``ReactionUpdateEvent.message_id: str`` валит фрейм.
+
+    MAX-сервер шлёт в JSON ``"messageId": <int64>`` (число), а Pydantic-модель
+    :class:`ReactionUpdateEvent` объявляет поле как ``str``. Pydantic 2.x
+    со строгим режимом **не** coerce-ит int → str, поэтому dispatcher
+    падает с::
+
+        pydantic_core._pydantic_core.ValidationError: 1 validation error
+        for ReactionUpdateEvent
+        messageId
+          Input should be a valid string [type=string_type,
+          input_value=116838091054923435, input_type=int]
+
+    Это симметричный баг к Patch 1: на **исходящей** стороне PyMax ждёт
+    int (Patch 1 чинит), на **входящей** — ждёт str (Patch 3 чинит).
+    Без Patch 3 dispatcher роняет фрейм в ``RuntimeError("Failed to
+    dispatch inbound frame")``, событие реакции теряется и мост не
+    зеркалит реакции MAX → TG.
+
+    Workaround: подменяем ``ReactionUpdateEvent.model_validate`` так,
+    чтобы перед валидацией привести ``messageId`` из int в str (если
+    он int). Другие поля не трогаем — Pydantic сам coerce-ит chat_id,
+    counters и total_count корректно.
+
+    После фикса upstream (``message_id: Union[int, str]``) этот патч
+    можно удалить — он идемпотентен.
+    """
+    from pymax.types.events.reaction import ReactionUpdateEvent
+
+    if getattr(ReactionUpdateEvent.model_validate, "_pymax_patched_coerce", False):
+        logger.debug(
+            "pymax_patches: ReactionUpdateEvent.model_validate already patched, "
+            "skipping",
+        )
+        return
+
+    _orig_validate = ReactionUpdateEvent.model_validate
+
+    @classmethod  # type: ignore[no-redef]
+    def _patched_validate(cls, obj, *args, **kwargs):
+        # ``obj`` обычно dict (или уже модель). Меняем только если есть
+        # ``messageId`` и он int — иначе оставляем всё как есть.
+        try:
+            if isinstance(obj, dict) and "messageId" in obj:
+                mid = obj["messageId"]
+                if isinstance(mid, int) and not isinstance(mid, bool):
+                    obj = dict(obj)
+                    obj["messageId"] = str(mid)
+        except Exception as exc:
+            logger.debug(
+                "pymax_patches: pre-validate messageId coerce failed: %s",
+                exc,
+            )
+        return _orig_validate.__func__(cls, obj, *args, **kwargs)
+
+    _patched_validate._pymax_patched_coerce = True  # type: ignore[attr-defined]
+    ReactionUpdateEvent.model_validate = _patched_validate
+    logger.info(
+        "pymax_patches: ReactionUpdateEvent.model_validate → "
+        "coerce messageId int→str (registered)",
     )

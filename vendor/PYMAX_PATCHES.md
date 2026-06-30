@@ -85,6 +85,35 @@ MAX-сервер шлёт **два** разных opcode:
 содержит `Opcode.NOTIF_MSG_YOU_REACTED` (upstream добавил). Функция
 идемпотентна — проверит наличие и пропустит.
 
+## Patch 3: `ReactionUpdateEvent.model_validate` coerce `messageId` int→str
+
+**Симптом:** при любом входящем событии реакции (opcode=155 или 156)
+dispatcher падает в `RuntimeError("Failed to dispatch inbound frame")`:
+
+```
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ReactionUpdateEvent
+messageId
+  Input should be a valid string [type=string_type, input_value=116838091054923435, input_type=int]
+```
+
+`opcode=155 cmd=0 seq=19` — фрейм полностью теряется, мост не зеркалит
+реакции MAX → TG даже после фикса Patch 2.
+
+**Причина:** в `pymax/types/events/reaction.py::ReactionUpdateEvent`
+поле объявлено как `message_id: str`, но MAX-сервер шлёт в JSON
+`"messageId": <int64>`. Pydantic 2.x в строгом режиме **не** coerce-ит
+int → str → ValidationError → фрейм падает в `RuntimeError`.
+
+**Workaround:** `_patch_reaction_event_message_id_coerce()` подменяет
+`ReactionUpdateEvent.model_validate` так, чтобы перед валидацией
+привести `messageId` из int в str (только если он int). Другие поля
+(`chat_id`, `counters`, `total_count`) Pydantic coerce-ит корректно —
+их не трогаем.
+
+**Когда удалять:** при обновлении PyMax до версии, где
+`ReactionUpdateEvent.message_id: Union[int, str]` (или просто `int`).
+Функция идемпотентна — проверит наличие маркера и пропустит.
+
 ---
 
 Другие баги добавляйте здесь по мере обнаружения.
