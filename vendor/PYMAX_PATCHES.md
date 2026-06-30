@@ -114,6 +114,82 @@ int → str → ValidationError → фрейм падает в `RuntimeError`.
 `ReactionUpdateEvent.message_id: Union[int, str]` (или просто `int`).
 Функция идемпотентна — проверит наличие маркера и пропустит.
 
+## Patch 4: `App.on_event` — не валить long-poll при ошибке парсинга
+
+**Симптом:** в логах MAX-процесса появляется
+
+```
+ERROR pymax.app: Failed to dispatch inbound frame: ...
+pydantic_core._pydantic_core.ValidationError: ...
+```
+
+после чего long-poll реконнектится, и из-за одного битого фрейма
+(например, новая схема payload или ``User.gender: int`` вместо ``str``)
+**все** последующие события теряются до переподключения. Если сервер
+шлёт тот же payload — цикл повторяется бесконечно.
+
+**Причина:** в `pymax/app.py::App.on_event` диспатчер сделан «хрупким»:
+любое исключение (включая ``ValidationError`` из Pydantic-моделей событий)
+заворачивается в ``RuntimeError`` и **raise** обратно в цикл long-poll.
+Long-poll в свою очередь тоже падает → реконнект → повтор.
+
+**Workaround:** `_patch_app_on_event_safe()` подменяет `App.on_event` на
+безопасную обёртку, которая при любом исключении логирует его в
+``logger.warning`` (видно в Railway-логах), но **не** raise-ит. Long-poll
+продолжает работать, битый фрейм просто пропускается, а следующие фреймы
+обрабатываются в штатном режиме.
+
+Идемпотентен — проверяет флаг ``_pymax_patched_safe`` на методе.
+
+**Когда удалять:** при обновлении PyMax до версии, где `App.on_event`
+делает ``try/except`` вокруг диспатчера сам (или логирует ошибку, не
+поднимая её в long-poll). Тогда всю функцию ``_patch_app_on_event_safe``
+можно удалить.
+
+## Patch 5: `get_reactions` — `messageIds` как `list[int]`
+
+**Симптом:** при попытке узнать, какие реакции поставил **сам** владелец
+моста на сообщение оппонента, мост логирует:
+
+```
+ERROR pymax.app: api error opcode=180 seq=N error=proto.payload
+  title=Ошибка валидации message=Expected number at 26
+```
+
+После чего ``client.get_reactions`` возвращает ``None`` →
+``your_reaction`` определяется как ``None`` → зеркальная реакция
+MAX → TG не ставится (хотя в ``bridge.on_reaction_update: event received``
+счётчики от MAX приходят — то есть сервер событие прислал, но мы не
+можем из него вытащить «свою» реакцию).
+
+**Причина:** в `pymax/api/messages/payloads.py::GetReactionsPayload`
+объявлено
+
+```python
+class GetReactionsPayload(CamelModel):
+    chat_id: int
+    message_ids: list[str]   # ← PyMax 2.2.0 BUG
+```
+
+PyMax шлёт ``messageIds`` как ``list[str]`` (строки), MAX-сервер по
+протоколу ``proto.payload`` ожидает ``list[int64]`` → ошибка
+``Expected number at 26``. Точно такой же баг, как и в Patch 1, только
+для ``get_reactions``.
+
+**Workaround:** `_patch_get_reactions_message_ids_int()` подменяет
+``MessageService.get_reactions`` так, чтобы формировать payload как dict
+с ``messageIds = [int(mid), ...]`` (минуя pydantic-валидацию
+``GetReactionsPayload.message_ids: list[str]``) и слать через
+``app.invoke(Opcode.MSG_GET_REACTIONS, payload)``. Разбор ответа
+(``messagesReactions`` → ``dict[message_id, ReactionInfo]``) повторяет
+логику оригинального метода.
+
+Идемпотентен — проверяет флаг ``_pymax_patched_msgids`` на методе.
+
+**Когда удалять:** при обновлении PyMax до версии, где
+``GetReactionsPayload.message_ids: list[int]``. Тогда функцию
+``_patch_get_reactions_message_ids_int`` можно удалить.
+
 ---
 
 Другие баги добавляйте здесь по мере обнаружения.

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -100,18 +101,41 @@ def register_bridge(client) -> None:
     async def _on_start(client) -> None:
         await on_start_actions(client)
 
-    # Логируем все входящие RAW-фреймы, в opcode которых есть подстрока
-    # "REACT" — чтобы понять, какие именно события о реакциях шлёт
-    # MAX-сервер. Если фреймов нет в потоке — сервер не отправляет события
-    # о реакциях (нужно пересоздать подписку / long-poll).
+    # В течение первых RAW_TRACE_WINDOW_SEC секунд после старта логируем
+    # ВСЕ уникальные opcode, которые MAX-сервер отправляет в long-poll
+    # (с дедупликацией — каждый opcode только один раз), плюс все
+    # фреймы, в opcode которых есть подстрока "REACT". Это нужно, чтобы
+    # выяснить, под каким именем (или вообще — шлёт ли) MAX-сервер события
+    # о реакциях, если они не приходят в обработчик on_reaction_update.
+    # После RAW_TRACE_WINDOW секунд остаётся только режим "REACT".
+    RAW_TRACE_WINDOW_SEC = 60.0
+    _raw_trace_started_at = time.monotonic()
+    _raw_seen_opcodes: set[str] = set()
+
     @client.on_raw()
     async def _on_raw_reaction_trace(frame: InboundFrame, client) -> None:
         opcode = getattr(frame, "opcode", None)
         op_str = str(opcode).upper() if opcode is not None else ""
+        payload_repr: Optional[str] = None
+        in_window = (time.monotonic() - _raw_trace_started_at) < RAW_TRACE_WINDOW_SEC
+        if in_window and op_str and op_str not in _raw_seen_opcodes:
+            _raw_seen_opcodes.add(op_str)
+            try:
+                payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
+            except Exception as exc:
+                payload_repr = f"<unreprable: {exc}>"
+            logger.info(
+                "raw.first-occurrence opcode=%s cmd=%s seq=%s payload=%s",
+                opcode,
+                getattr(frame, "cmd", "?"),
+                getattr(frame, "seq", "?"),
+                payload_repr,
+            )
         if "REACT" not in op_str:
             return
         try:
-            payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
+            if payload_repr is None:
+                payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
         except Exception as exc:
             payload_repr = f"<unreprable: {exc}>"
         logger.info(
