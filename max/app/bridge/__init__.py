@@ -101,41 +101,35 @@ def register_bridge(client) -> None:
     async def _on_start(client) -> None:
         await on_start_actions(client)
 
-    # В течение первых RAW_TRACE_WINDOW_SEC секунд после старта логируем
-    # ВСЕ уникальные opcode, которые MAX-сервер отправляет в long-poll
-    # (с дедупликацией — каждый opcode только один раз), плюс все
-    # фреймы, в opcode которых есть подстрока "REACT". Это нужно, чтобы
-    # выяснить, под каким именем (или вообще — шлёт ли) MAX-сервер события
-    # о реакциях, если они не приходят в обработчик on_reaction_update.
-    # После RAW_TRACE_WINDOW секунд остаётся только режим "REACT".
-    RAW_TRACE_WINDOW_SEC = 60.0
-    _raw_trace_started_at = time.monotonic()
-    _raw_seen_opcodes: set[str] = set()
+    # Логируем КАЖДЫЙ фрейм, похожий на реакцию — и по opcode (подстрока
+    # "REACT" в имени/строковом представлении), и по содержимому payload
+    # (на случай, если opcode приходит числом/неизвестным, но в payload
+    # есть notif_msg_reactions_changed / notif_msg_you_reacted).
+    # Это нужно, чтобы выяснить, под каким opcode MAX-сервер реально
+    # шлёт события о реакциях, если они не приходят в on_reaction_update.
+    def _looks_like_reaction_payload(payload: Any) -> bool:
+        if payload is None:
+            return False
+        try:
+            text = repr(payload).lower()
+        except Exception:
+            return False
+        return (
+            "reaction" in text
+            or "notif_msg_reactions_changed" in text
+            or "notif_msg_you_reacted" in text
+        )
 
     @client.on_raw()
     async def _on_raw_reaction_trace(frame: InboundFrame, client) -> None:
         opcode = getattr(frame, "opcode", None)
         op_str = str(opcode).upper() if opcode is not None else ""
-        payload_repr: Optional[str] = None
-        in_window = (time.monotonic() - _raw_trace_started_at) < RAW_TRACE_WINDOW_SEC
-        if in_window and op_str and op_str not in _raw_seen_opcodes:
-            _raw_seen_opcodes.add(op_str)
-            try:
-                payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
-            except Exception as exc:
-                payload_repr = f"<unreprable: {exc}>"
-            logger.info(
-                "raw.first-occurrence opcode=%s cmd=%s seq=%s payload=%s",
-                opcode,
-                getattr(frame, "cmd", "?"),
-                getattr(frame, "seq", "?"),
-                payload_repr,
-            )
-        if "REACT" not in op_str:
+        if "REACT" not in op_str and not _looks_like_reaction_payload(
+            getattr(frame, "payload", None)
+        ):
             return
         try:
-            if payload_repr is None:
-                payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
+            payload_repr = repr(frame.payload) if frame.payload else "None"
         except Exception as exc:
             payload_repr = f"<unreprable: {exc}>"
         logger.info(
