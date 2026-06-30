@@ -425,8 +425,10 @@ def register_bridge(client) -> None:
 
         1. ``to_tg_summary`` — сводка «👍×N 🔥×M · итого K» под
            входящим сообщением из MAX в топике супергруппы. Используется
-           ВСЕМИ реакциями в группе/канале (включая чужие). В ЛС не нужно —
-           владелец видит только свою реакцию через ``setMessageReaction``.
+           ВСЕМИ реакциями в группе/канале (включая чужие). **В DIALOG НЕ
+           шлётся** — в ЛС владелец видит только свою реакцию через
+           ``setMessageReaction``, отдельное сообщение-сводка под исходным
+           сообщением не нужна.
 
         2. ``to_tg`` для DIALOG — точная зеркальная реакция оппонента в ЛС
            (берём первую эмодзи из ``counters``). В DIALOG моста MAX ↔ TG
@@ -455,15 +457,42 @@ def register_bridge(client) -> None:
                 int(getattr(event, "total_count", 0) or 0),
             )
 
-            # 1) Сводка по счётчикам — кидаем всегда, когда MAX прислал
-            #    ненулевой апдейт. Бот сам разберётся: если это ЛС или
-            #    сообщение ещё не доставлено в TG — пропустит.
+            # Подготовим counters/total заранее — они нужны и для сводки,
+            # и для DIALOG-ветки (выбор первой эмодзи).
             counters = [
                 {"reaction": getattr(c, "reaction", "?"), "count": int(getattr(c, "count", 0))}
                 for c in (event.counters or [])
             ]
             total = int(getattr(event, "total_count", 0) or 0)
-            if counters or total > 0:
+
+            # Определяем тип чата ОДИН раз: DIALOG → зеркалим оппонента
+            # (ветка 2) и НЕ шлём сводку, CHAT/CHANNEL → зеркалим только
+            # свою реакцию (ветка 3) и шлём сводку. ``_resolve_chat_type``
+            # сперва смотрит ``client.chats``, затем — ``client.get_chat``.
+            # Если определить не удалось — ``is_dialog`` остаётся ``False``,
+            # и мы ведём себя по старому «безопасному» пути (сводка шлётся).
+            chat_type = _resolve_chat_type(client, event.chat_id)
+            is_dialog = (chat_type == ChatType.DIALOG)
+            logger.info(
+                "bridge.on_reaction_update: chat_type=%s is_dialog=%s "
+                "chat=%s msg=%s",
+                chat_type, is_dialog, chat_id_str, msg_id_str,
+            )
+
+            # 1) Сводка по счётчикам — кидаем ТОЛЬКО для CHAT/CHANNEL.
+            #    В DIALOG сводка не нужна: в ЛС владелец видит свою реакцию
+            #    через ``setMessageReaction`` (``to_tg``), а лишнее
+            #    сообщение-«итого реакций» под исходным сообщением только
+            #    шумит. Если chat_type не определился — оставляем старое
+            #    поведение и шлём сводку (безопасный fallback).
+            if is_dialog:
+                if counters or total > 0:
+                    logger.info(
+                        "bridge.on_reaction_update: DIALOG chat, skip "
+                        "to_tg_summary chat=%s msg=%s counters=%s total=%d",
+                        chat_id_str, msg_id_str, counters, total,
+                    )
+            elif counters or total > 0:
                 await _post(
                     "/reaction_ops",
                     {
@@ -481,19 +510,8 @@ def register_bridge(client) -> None:
                     chat_id_str, msg_id_str, counters, total,
                 )
 
-            # 2/3) Выбор ветки зеркалирования в TG.
-            # Определяем тип чата: DIALOG → зеркалим оппонента (ветка 2),
-            # CHAT/CHANNEL → зеркалим только свою реакцию (ветка 3).
-            # ``_resolve_chat_type`` сперва смотрит ``client.chats``,
-            # затем — ``client.get_chat``. Если определить не удалось —
-            # остаёмся на старом пути «your_reaction» (безопасно).
-            chat_type = _resolve_chat_type(client, event.chat_id)
-            is_dialog = (chat_type == ChatType.DIALOG)
-            logger.info(
-                "bridge.on_reaction_update: chat_type=%s is_dialog=%s "
-                "chat=%s msg=%s",
-                chat_type, is_dialog, chat_id_str, msg_id_str,
-            )
+            # 2/3) Выбор ветки зеркалирования в TG. ``chat_type`` /
+            # ``is_dialog`` уже определены выше, повторно не вызываем.
 
             if is_dialog:
                 # Ветка DIALOG: зеркалим первую эмодзи из counters.
