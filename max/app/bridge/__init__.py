@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -36,6 +37,7 @@ from pymax.types.domain.attachments import (
     VideoAttachment,
 )
 from pymax.types.domain.enums import ChatType
+from pymax.types.events import ReactionUpdateEvent
 
 from app.bridge.chats import chat_to_dict, display_name_of
 from app.bridge.media import process_file, process_photo, process_video
@@ -215,3 +217,84 @@ def register_bridge(client) -> None:
             )
         except Exception as exc:
             logger.exception("on_message handler failed: %s", exc)
+
+    @client.on_reaction_update()
+    async def _on_reaction_update(event: ReactionUpdateEvent, client) -> None:
+        """Прокидываем обновления реакций из MAX в мост.
+
+        Два независимых потока:
+
+        1. ``to_tg_summary`` — сводка «👍×N 🔥×M · итого K» под
+           входящим сообщением из MAX в топике супергруппы. Используется
+           ВСЕМИ реакциями в группе/канале (включая чужие). В ЛС не нужно —
+           владелец видит только свою реакцию через ``setMessageReaction``.
+
+        2. ``to_tg`` — точная зеркальная реакция бота в TG на ту же
+           эмодзи, которую поставил владелец моста в MAX (через
+           ``client.get_reactions`` узнаём ``your_reaction``). Если
+           владелец ничего не ставил — задача не создаётся.
+        """
+        try:
+            chat_id_str = str(event.chat_id)
+            msg_id_str = str(event.message_id)
+
+            # 1) Сводка по счётчикам — кидаем всегда, когда MAX прислал
+            #    ненулевой апдейт. Бот сам разберётся: если это ЛС или
+            #    сообщение ещё не доставлено в TG — пропустит.
+            counters = [
+                {"reaction": getattr(c, "reaction", "?"), "count": int(getattr(c, "count", 0))}
+                for c in (event.counters or [])
+            ]
+            total = int(getattr(event, "total_count", 0) or 0)
+            if counters or total > 0:
+                await _post(
+                    "/reaction_ops",
+                    {
+                        "direction": "to_tg_summary",
+                        "op": "summary_update",
+                        "max_chat_id": chat_id_str,
+                        "max_message_id": msg_id_str,
+                        "counters_json": json.dumps(counters, ensure_ascii=False),
+                        "total_count": total,
+                    },
+                )
+
+            # 2) Зеркальная реакция владельца: узнаём ``your_reaction``.
+            #    Если MAX-сервер не возвращает нашу реакцию (None) — задачу
+            #    не создаём (бот ранее уже мог снять свою через ``to_max``).
+            try:
+                reactions_map = await client.get_reactions(
+                    chat_id=event.chat_id,
+                    message_ids=[str(event.message_id)],
+                )
+            except Exception as exc:
+                logger.debug(
+                    "on_reaction_update: get_reactions(%s/%s) failed: %s",
+                    chat_id_str, msg_id_str, exc,
+                )
+                reactions_map = None
+            your_reaction: Optional[str] = None
+            if reactions_map:
+                # PyMax возвращает ``dict[str, ReactionInfo]`` — ключ — message_id.
+                ri = reactions_map.get(str(event.message_id))
+                if ri is not None:
+                    your_reaction = getattr(ri, "your_reaction", None)
+            if not your_reaction:
+                # Нет своей реакции у владельца моста — зеркалить нечего.
+                return
+            await _post(
+                "/reaction_ops",
+                {
+                    "direction": "to_tg",
+                    "op": "add",
+                    "max_chat_id": chat_id_str,
+                    "max_message_id": msg_id_str,
+                    "emoji": your_reaction,
+                },
+            )
+            logger.info(
+                "on_reaction_update: mirrored your_reaction=%s chat=%s msg=%s",
+                your_reaction, chat_id_str, msg_id_str,
+            )
+        except Exception as exc:
+            logger.exception("on_reaction_update handler failed: %s", exc)

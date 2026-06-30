@@ -178,7 +178,12 @@ class EventPoller:
                     # с самим событием (текст/медиа), а не отдельным
                     # сообщением «—» — иначе кнопки «отваливаются»
                     # от контекста и через 48ч Telegram запрещает на них нажимать.
-                    kb = event_inline_keyboard(ev.get("id", 0), max_chat_id)
+                    kb = event_inline_keyboard(
+                        ev.get("id", 0),
+                        max_chat_id,
+                        chat_type=chat_type,
+                        max_message_id=str(ev.get("max_message_id") or ""),
+                    )
                     header = None  # sender сам вызовет _format_header
 
                 sent = await forward_event(
@@ -187,6 +192,22 @@ class EventPoller:
                     message_thread_id=thread_id,
                     header_override=header,
                 )
+                # Сохраняем обратную TG-ссылку на сообщение (нужно для
+                # двусторонней синхронизации реакций). Best-effort — если
+                # запрос не прошёл, реакции просто не будут зеркалиться.
+                if sent is not None:
+                    try:
+                        await api.record_tg_mapping(
+                            event_id=int(ev.get("id") or 0),
+                            tg_chat_id=sg_chat_id,
+                            tg_thread_id=thread_id,
+                            tg_message_id=int(sent.message_id),
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "forward event %s: record_tg_mapping failed: %s",
+                            ev.get("id"), exc,
+                        )
                 if self._is_compact() and sent is not None:
                     await self._mark_incoming_reaction(
                         sg_chat_id, sent.message_id,

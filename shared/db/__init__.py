@@ -52,6 +52,7 @@ from shared.db._models import (  # noqa: F401
     ChatTopic,
     DeliveredMessage,
     Event,
+    ReactionOpsQueue,
     SendQueue,
     SuperGroup,
     SystemState,
@@ -105,9 +106,13 @@ from shared.db.auth_state import (  # noqa: F401
 
 # read_receipts
 from shared.db.read_receipts import (  # noqa: F401
+    get_delivered_by_max_message,
+    get_delivered_by_tg_message,
     get_pending_read_receipts,
     mark_delivered_as_read,
     record_delivered,
+    record_delivered_with_tg,
+    set_summary_message_id,
     update_chat_read_state,
 )
 
@@ -155,4 +160,19 @@ from shared.db.chat_ops_queue import (  # noqa: F401
     requeue_failed as requeue_failed_chat_op,
     payload_of as chat_op_payload_of,
     result_of as chat_op_result_of,
+)
+
+# reaction_ops_queue — двусторонняя очередь операций над реакциями
+# (лайки/смайлики) MAX ↔ Telegram. Три направления: ``to_max`` /
+# ``to_tg`` / ``to_tg_summary``. MAX-процесс забирает только ``to_max``;
+# бот забирает ``to_tg`` и ``to_tg_summary`` через ``ReactionsMaxPoller``.
+from shared.db.reaction_ops import (  # noqa: F401
+    enqueue_reaction_op,
+    claim_next_reaction_op,
+    finish_reaction_op,
+    get_reaction_op,
+    list_pending_reaction_ops,
+    queue_stats as reaction_ops_queue_stats,
+    VALID_DIRECTIONS as REACTION_OPS_VALID_DIRECTIONS,
+    VALID_OPS as REACTION_OPS_VALID_OPS,
 )

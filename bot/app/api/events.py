@@ -42,3 +42,21 @@ class EventsApiMixin:
 
     async def mark_delivered(self, event_id: int) -> None:
         await self._client.mark_delivered(event_id)
+
+    async def record_tg_mapping(
+        self,
+        event_id: int,
+        tg_chat_id: int,
+        tg_thread_id: Optional[int],
+        tg_message_id: int,
+    ) -> None:
+        """Сохранить обратную TG-ссылку (нужно для двусторонних реакций).
+
+        Проксирует ``POST /events/{id}/tg-mapping``.
+        """
+        await self._client.record_tg_mapping(
+            event_id=event_id,
+            tg_chat_id=tg_chat_id,
+            tg_thread_id=tg_thread_id,
+            tg_message_id=tg_message_id,
+        )

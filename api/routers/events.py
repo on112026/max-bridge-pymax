@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from shared import db
 from shared.api_auth import verify_api_key
 
-from api.routers.schemas import EventIn, EventOut, OkOut
+from api.routers.schemas import EventIn, EventOut, OkOut, TgMappingIn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -114,4 +114,40 @@ def mark_event_delivered(event_id: int) -> OkOut:
                 db.record_delivered(row.max_chat_id, row.max_message_id)
     except Exception as exc:
         logger.warning("record_delivered for event %s failed: %s", event_id, exc)
+    return OkOut(ok=True)
+
+
+@router.post(
+    "/events/{event_id}/tg-mapping",
+    response_model=OkOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def post_event_tg_mapping(event_id: int, body: TgMappingIn) -> OkOut:
+    """Сохранить обратную TG-ссылку для события из MAX.
+
+    Вызывается из :class:`bot.app.forwarder.EventPoller` сразу после
+    успешной отправки сообщения в TG: ``tg_chat_id`` / ``tg_thread_id``
+    / ``tg_message_id`` нужны двусторонней синхронизации реакций
+    (``MessageReactionUpdated`` → ``max_chat_id``/``max_message_id`` и
+    наоборот, для ``setMessageReaction``).
+
+    Best-effort: если событие не найдено в ``events``, обновление
+    ``delivered_messages`` всё равно проходит — TG-ссылка нужна для
+    будущих реакций, даже если запись события удалили.
+    """
+    try:
+        with db.session_scope() as s:
+            row = s.get(db.Event, event_id)
+            if row is not None:
+                db.record_delivered_with_tg(
+                    row.max_chat_id,
+                    row.max_message_id,
+                    tg_chat_id=body.tg_chat_id,
+                    tg_thread_id=body.tg_thread_id,
+                    tg_message_id=body.tg_message_id,
+                )
+    except Exception as exc:
+        logger.warning(
+            "record_delivered_with_tg for event %s failed: %s", event_id, exc,
+        )
     return OkOut(ok=True)

@@ -26,12 +26,14 @@ from aiogram import Dispatcher, F
 # Импорт из подмодулей нужен для регистрации, поэтому используем обычный import.
 # ``auth`` и ``supergroup`` — теперь пакеты с несколькими модулями.
 from app.handlers import auth  # noqa: F401  (reauth / event_callbacks / auth_action / topic_echo)
-from app.handlers import basic, chat_ops, prune_topics, reply, sessions  # noqa: F401
+from app.handlers import basic, chat_ops, prune_topics, reactions_callback, reply, sessions  # noqa: F401
+from app.handlers import reactions_tg  # noqa: F401  (MessageReactionUpdated router)
 from app.handlers import supergroup  # noqa: F401  (attach + commands)
 from app.keyboards import (
     AuthActionCallback,
     EventActionCallback,
     PruneTopicCallback,
+    ReactionSummaryCallback,
     SessionUseCallback,
 )
 from app.states import ReplyState, UploadSessionState
@@ -115,6 +117,16 @@ def register_handlers(dp: Dispatcher) -> None:
 
     # Inline-кнопки /prune_topics (закрытие stale-топиков).
     dp.callback_query.register(prune_topics.prune_topic_callback, PruneTopicCallback.filter())
+
+    # Inline-кнопка «🔄 Реакции» под сообщением из MAX (только в группе/канале).
+    dp.callback_query.register(
+        reactions_callback.reaction_summary_callback,
+        ReactionSummaryCallback.filter(),
+    )
+
+    # Реакции TG → MAX (``MessageReactionUpdated``). Внутри router
+    # фильтрует по владельцу и привязанной супергруппе.
+    dp.include_router(reactions_tg.router)
 
     # ---------- «Эхо» из топика супергруппы в MAX (catch-all) ----------
     # Регистрируем ПОСЛЕДНИМ, чтобы он срабатывал только когда не сматчились

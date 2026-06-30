@@ -56,6 +56,17 @@ class EventOut(BaseModel):
     is_outgoing: bool
 
 
+class TgMappingIn(BaseModel):
+    """Тело ``POST /events/{id}/tg-mapping`` от бота.
+
+    Обратная TG-ссылка для двусторонней синхронизации реакций.
+    """
+
+    tg_chat_id: int
+    tg_thread_id: Optional[int] = None
+    tg_message_id: int
+
+
 # ---------- Chats ----------
 
 

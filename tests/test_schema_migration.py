@@ -203,8 +203,101 @@ def main() -> int:
         assert by_cid["group-1"].chat_type == "CHAT", by_cid
         assert by_cid["channel-1"].chat_type == "CHANNEL", by_cid
 
+    # ---- Шаг 7: миграция reaction_ops_queue (новая таблица для реакций) ----
+    # На свежей БД таблица должна создаться автоматически через
+    # ``Base.metadata.create_all``. Проверяем enqueue/claim/finish
+    # для всех направлений.
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "bridge_reactions.db")
+        # Сбрасываем engine, чтобы init_engine сработал заново.
+        db._engine = None  # type: ignore[attr-defined]
+        db._SessionLocal = None  # type: ignore[attr-defined]
+        db.init_engine(db_path)
+
+        # Подложим владельца + supergroup (нужно для внешних ключей в
+        # ``DeliveredMessage``).
+        with db.session_scope() as s:
+            from shared.db._models import SuperGroup as _SG, DeliveredMessage as _DM  # noqa: WPS433
+            s.add(_SG(owner_user_id=1, supergroup_chat_id=12345))
+            # И запись доставки, чтобы можно было ставить tg_summary_message_id.
+            s.add(_DM(
+                max_chat_id="42",
+                max_message_id="100",
+                tg_chat_id=12345,
+                tg_message_id=999,
+            ))
+            s.flush()
+
+        # Enqueue ``to_max`` add.
+        item_id = db.enqueue_reaction_op({
+            "direction": "to_max",
+            "op": "add",
+            "max_chat_id": "42",
+            "max_message_id": "100",
+            "emoji": "👍",
+        })
+        assert item_id > 0
+
+        # Enqueue ``to_tg`` (без emoji — бот возьмёт из reaction_info).
+        item_id_2 = db.enqueue_reaction_op({
+            "direction": "to_tg",
+            "op": "add",
+            "max_chat_id": "42",
+            "max_message_id": "100",
+            "emoji": "🔥",
+        })
+        assert item_id_2 > item_id
+
+        # Enqueue ``to_tg_summary`` со счётчиками.
+        item_id_3 = db.enqueue_reaction_op({
+            "direction": "to_tg_summary",
+            "op": "summary_update",
+            "max_chat_id": "42",
+            "max_message_id": "100",
+            "counters_json": '[{"reaction":"👍","count":3},{"reaction":"🔥","count":1}]',
+            "total_count": 4,
+        })
+        assert item_id_3 > item_id_2
+
+        # Claim для каждого направления.
+        c1 = db.claim_next_reaction_op("to_max")
+        assert c1 is not None and c1.direction == "to_max" and c1.op == "add"
+        c2 = db.claim_next_reaction_op("to_tg")
+        assert c2 is not None and c2.direction == "to_tg"
+        c3 = db.claim_next_reaction_op("to_tg_summary")
+        assert c3 is not None and c3.direction == "to_tg_summary"
+        assert c3.total_count == 4
+
+        # Finish + проверка tg_summary_message_id.
+        db.finish_reaction_op(c3.id, ok=True)
+        db.set_summary_message_id(
+            max_chat_id="42", max_message_id="100", summary_message_id=1001,
+        )
+        mapping = db.get_delivered_by_max_message(
+            max_chat_id="42", max_message_id="100",
+        )
+        assert mapping is not None
+        assert mapping.tg_summary_message_id == 1001
+        assert mapping.tg_message_id == 999
+
+        # Невалидный op/direction.
+        try:
+            db.enqueue_reaction_op({"direction": "bogus", "op": "add"})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError on invalid direction")
+
+        try:
+            db.enqueue_reaction_op({"direction": "to_max", "op": "bogus"})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError on invalid op")
+
     print("OK: schema migration applied, SELECT/INSERT/UPDATE работают")
     print("OK: topic_sync_jobs.chat_type мигрирует и прокидывается")
+    print("OK: reaction_ops_queue создаётся, enqueue/claim/finish работают")
     return 0
 
 

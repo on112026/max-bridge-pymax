@@ -68,6 +68,73 @@ class ApiClient(ChatOpsHttpMixin):
         )
         r.raise_for_status()
 
+    async def list_pending_reaction_ops(
+        self,
+        direction: str,
+        after_id: int = 0,
+        limit: int = 50,
+    ) -> list:
+        """Забрать список pending-задач очереди реакций.
+
+        Используется воркером ``ReactionsMaxPoller`` в боте (направления
+        ``to_tg`` / ``to_tg_summary``).
+        """
+        params = {
+            "direction": str(direction),
+            "limit": str(limit),
+        }
+        if after_id:
+            params["after_id"] = str(after_id)
+        r = await self._client.get(
+            "/reaction_ops/list",
+            params=params,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        return list(data.get("items") or [])
+
+    async def finish_reaction_op(
+        self,
+        item_id: int,
+        ok: bool = True,
+        error: Optional[str] = None,
+    ) -> None:
+        """Пометить задачу очереди реакций ``done``/``failed``."""
+        r = await self._client.post(
+            f"/reaction_ops/{item_id}/finish",
+            json={"ok": bool(ok), "error": error},
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+
+    async def record_tg_mapping(
+        self,
+        event_id: int,
+        tg_chat_id: int,
+        tg_thread_id: Optional[int],
+        tg_message_id: int,
+    ) -> None:
+        """Сохранить обратную TG-ссылку для события (``POST /events/{id}/tg-mapping``).
+
+        Нужно двусторонней синхронизации реакций: ``MessageReactionUpdated``
+        в TG даёт ``tg_message_id``; чтобы найти соответствующий
+        ``max_chat_id``/``max_message_id``, мост смотрит запись в
+        ``delivered_messages``, заполненную этим методом в ``EventPoller``.
+        """
+        r = await self._client.post(
+            f"/events/{event_id}/tg-mapping",
+            json={
+                "tg_chat_id": int(tg_chat_id),
+                "tg_thread_id": (
+                    int(tg_thread_id) if tg_thread_id is not None else None
+                ),
+                "tg_message_id": int(tg_message_id),
+            },
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+
     async def list_chats(self) -> list:
         r = await self._client.get("/chats", headers=self._headers())
         r.raise_for_status()

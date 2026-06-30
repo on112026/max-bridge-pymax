@@ -30,6 +30,7 @@ from app.api.chat_ops import ChatOpsApiMixin
 from app.api.chats import ChatsApiMixin
 from app.api.core import BotApi
 from app.api.events import EventsApiMixin
+from app.api.reactions import ReactionsApiMixin
 from app.api.send import SendApiMixin
 from app.api.sessions import SessionsApiMixin
 from app.api.topics import TopicsApiMixin
@@ -44,6 +45,7 @@ class BotApiComposite(
     SessionsApiMixin,
     TopicsApiMixin,
     ChatOpsApiMixin,
+    ReactionsApiMixin,
 ):
     """Финальный ``BotApi`` со всеми методами из миксинов.
 

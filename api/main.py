@@ -43,6 +43,7 @@ from api.routers import (  # noqa: E402
     chats,
     events,
     health,
+    reaction_ops,
     send,
     sessions,
     status,
@@ -77,3 +78,4 @@ app.include_router(topic_jobs.router)
 app.include_router(topics.router)
 app.include_router(sync.router)
 app.include_router(chat_ops.router)
+app.include_router(reaction_ops.router)

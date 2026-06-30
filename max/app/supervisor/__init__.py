@@ -54,6 +54,7 @@ from typing import Optional
 from pymax import Client
 
 from app import chat_ops
+from app import reactions_loop as reactions
 from app.sender import sender_loop
 from app.supervisor._backoff import (
     AUTH_FAIL_BACKOFF,
@@ -213,6 +214,13 @@ async def run() -> None:
     # когда Client появится.
     chat_ops_task = asyncio.create_task(
         chat_ops.chat_ops_loop(stop_event), name="chat-ops",
+    )
+    # Реакции: polling ``reaction_ops_queue`` с direction=to_max.
+    # Воркер сам фильтрует (API возвращает только ``to_max``). Ошибки
+    # внутри не валят supervisor — они логируются и задача помечается
+    # ``failed`` (см. ``reactions_loop``).
+    reactions_task = asyncio.create_task(
+        reactions.reactions_loop(stop_event), name="reactions",
     )
 
     try:
@@ -389,6 +397,7 @@ async def run() -> None:
                 shared_db.set_notify_message("🔐 Запрашиваю SMS-код у MAX…")
                 client = build_client(phone, cache_dir)
                 chat_ops.set_client(client)
+                reactions.set_client(client)
                 client_task = asyncio.create_task(
                     _long_running_start(client, stop_event), name="pymax-client",
                 )
@@ -446,6 +455,7 @@ async def run() -> None:
                 shared_db.set_notify_message("📂 Подключаюсь по сохранённой сессии…")
                 client = build_client(phone, cache_dir)
                 chat_ops.set_client(client)
+                reactions.set_client(client)
                 client_task = asyncio.create_task(
                     _long_running_start(client, stop_event), name="pymax-client",
                 )
@@ -500,7 +510,14 @@ async def run() -> None:
                 await chat_ops_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if reactions_task is not None and not reactions_task.done():
+            reactions_task.cancel()
+            try:
+                await reactions_task
+            except (asyncio.CancelledError, Exception):
+                pass
         chat_ops.clear_client()
+        reactions.clear_client()
         if client is not None:
             try:
                 await client.close()

@@ -11,12 +11,14 @@
 | `events` | max → bot | входящие события MAX (сообщения, изменения чатов) |
 | `send_queue` | bot → max | исходящие сообщения (текст + одно вложение) |
 | `chat_ops_queue` | bot → max | admin-операции (`/join`, `/invite`, `/pending`, …) |
+| `reaction_ops_queue` | двусторонняя | операции над реакциями: `to_max` (add/remove/fetch_summary), `to_tg` (`setMessageReaction`), `to_tg_summary` (обновить сводку) |
 | `chats` | max → bot | кэш MAX-чатов |
 | `topics` | bot ↔ api | маппинг MAX-чат ↔ TG-топик |
 | `supergroups` | bot → api | привязка TG-супергруппы к владельцу |
-| `topic_jobs` | bot → api | фоновые задачи синхронизации топиков |
+| `topic_jobs` | bot → api | фоновые задачи синка топиков (создание/переименование) |
 | `auth_state` | max → bot | состояние MAX-клиента (`need_2fa` / `ok`) |
 | `read_receipts` | bot → max | доставленные/прочитанные сообщения |
+| `delivered_messages.tg_*` | bot → api | обратная TG-ссылка для двусторонней синхронизации реакций (`tg_chat_id` / `tg_thread_id` / `tg_message_id` / `tg_summary_message_id`) |
 
 ## Цикл-воркеры в `max/`
 

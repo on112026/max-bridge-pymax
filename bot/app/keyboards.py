@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from aiogram import types
 from aiogram.filters.callback_data import CallbackData
 
@@ -41,6 +43,22 @@ class PruneTopicCallback(CallbackData, prefix="prune_topic"):
     max_chat_id: str = ""
 
 
+class ReactionSummaryCallback(CallbackData, prefix="rx_sum"):
+    """Inline-кнопка «🔄 Реакции» под сообщением из MAX в группе/канале.
+
+    По клику бот перезапрашивает ``client.get_reactions`` в MAX,
+    кладёт ``to_tg_summary``-задачу в ``reaction_ops_queue`` и
+    воркер ``ReactionsMaxPoller`` обновит сводку «👍×N 🔥×M · итого K»
+    под сообщением.
+
+    ``max_chat_id`` хранится в callback_data (в отличие от ``event_id``,
+    тут размер не критичен — MAX chat_id обычно 18-20 цифр).
+    """
+
+    max_chat_id: str
+    max_message_id: str
+
+
 def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
     return types.ReplyKeyboardMarkup(
         keyboard=[
@@ -60,7 +78,12 @@ def main_reply_keyboard() -> types.ReplyKeyboardMarkup:
     )
 
 
-def event_inline_keyboard(event_id: int, max_chat_id: str = "") -> types.InlineKeyboardMarkup:
+def event_inline_keyboard(
+    event_id: int,
+    max_chat_id: str = "",
+    chat_type: Optional[str] = None,
+    max_message_id: Optional[str] = None,
+) -> types.InlineKeyboardMarkup:
     """Inline-клавиатура под сообщением из MAX.
 
     Использует ``EventActionCallback`` (CallbackData-класс) — это критично
@@ -70,28 +93,58 @@ def event_inline_keyboard(event_id: int, max_chat_id: str = "") -> types.InlineK
     Параметр ``max_chat_id`` оставлен в сигнатуре для совместимости с
     другими местами вызова и игнорируется (хэндлер достаёт ``max_chat_id``
     из БД через ``api.get_event(event_id)``).
+
+    Параметр ``chat_type`` управляет кнопкой «🔄 Реакции»:
+
+    * ``"CHAT"`` / ``"CHANNEL"`` (или ``"chat"`` / ``"channel"``) — добавляем
+      кнопку, по клику бот перезапросит ``get_reactions`` и обновит сводку
+      «👍×N 🔥×M · итого K» под сообщением в топике.
+    * ``"DIALOG"`` (или ``None``, неизвестный тип) — кнопку не показываем,
+      в ЛС достаточно зеркальной реакции бота (через ``MessageReactionUpdated``
+      + ``setMessageReaction``).
+
+    Параметр ``max_message_id`` нужен для ``ReactionSummaryCallback``;
+    если не передан — кнопку не добавляем (старые пути вызова).
     """
     eid = int(event_id) if event_id else 0
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows: list[list[types.InlineKeyboardButton]] = [
+        [
+            types.InlineKeyboardButton(
+                text="💬 Ответить",
+                callback_data=EventActionCallback(action="reply", event_id=eid).pack(),
+            ),
+            types.InlineKeyboardButton(
+                text="📋 ID чата",
+                callback_data=EventActionCallback(action="showid", event_id=eid).pack(),
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🔄 История",
+                callback_data=EventActionCallback(action="history", event_id=eid).pack(),
+            ),
+        ],
+    ]
+    # Кнопку реакций показываем только в группе/канале (там «чужие»
+    # реакции отражаются в сводке). В ЛС — только зеркальная реакция.
+    normalized_type = (chat_type or "").upper() if chat_type else ""
+    if (
+        normalized_type in ("CHAT", "CHANNEL")
+        and max_chat_id
+        and max_message_id
+    ):
+        rows.append(
             [
                 types.InlineKeyboardButton(
-                    text="💬 Ответить",
-                    callback_data=EventActionCallback(action="reply", event_id=eid).pack(),
+                    text="🔄 Реакции",
+                    callback_data=ReactionSummaryCallback(
+                        max_chat_id=str(max_chat_id),
+                        max_message_id=str(max_message_id),
+                    ).pack(),
                 ),
-                types.InlineKeyboardButton(
-                    text="📋 ID чата",
-                    callback_data=EventActionCallback(action="showid", event_id=eid).pack(),
-                ),
-            ],
-            [
-                types.InlineKeyboardButton(
-                    text="🔄 История",
-                    callback_data=EventActionCallback(action="history", event_id=eid).pack(),
-                ),
-            ],
-        ]
-    )
+            ]
+        )
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def auth_choice_keyboard(

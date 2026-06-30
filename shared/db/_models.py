@@ -153,6 +153,14 @@ class DeliveredMessage(Base):
     Это «базовая линия» для пометки прочитанным: MAX-процесс помечает
     прочитанными только те сообщения, которые доставлены в TG и пользователь
     как-то отреагировал (см. ``ChatReadState``).
+
+    Поля ``tg_chat_id`` / ``tg_thread_id`` / ``tg_message_id`` хранят
+    обратную ссылку из MAX-сообщения на конкретное TG-сообщение в
+    супергруппе-топике. Нужны для двусторонней синхронизации реакций
+    (TG→MAX: TG-хэндлер реакций достаёт ``max_chat_id``/``max_message_id``
+    по ``tg_message_id``; MAX→TG: мост ставит реакцию ботом в TG).
+    ``tg_summary_message_id`` — id сообщения-сводки по «чужим» реакциям
+    в группе/канале (создаётся при первом ``summary_update``).
     """
 
     __tablename__ = "delivered_messages"
@@ -161,6 +169,12 @@ class DeliveredMessage(Base):
     max_message_id = Column(String, index=True, nullable=False)
     delivered_at = Column(DateTime, default=datetime.utcnow, index=True)
     read_at = Column(DateTime, nullable=True, index=True)
+    # --- TG-обратная ссылка (заполняется в EventPoller) ---
+    tg_chat_id = Column(Integer, nullable=True, index=True)
+    tg_thread_id = Column(Integer, nullable=True)
+    tg_message_id = Column(Integer, nullable=True)
+    # --- Сообщение-сводка по «чужим» реакциям (только для CHAT/CHANNEL) ---
+    tg_summary_message_id = Column(Integer, nullable=True)
 
 
 class ChatReadState(Base):
@@ -307,4 +321,61 @@ class ChatOpsQueue(Base):
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     # Количество попыток (для будущего backoff в worker'е).
+    attempts = Column(Integer, nullable=False, default=0)
+
+
+class ReactionOpsQueue(Base):
+    """Очередь операций над реакциями (лайки/смайлики) MAX ↔ Telegram.
+
+    Паттерн тот же, что и в ``SendQueue`` / ``ChatOpsQueue``: одна таблица,
+    три «направления» через колонку ``direction``:
+
+    * ``"to_max"``          — задача для MAX-процесса: применить
+      ``add_reaction`` / ``remove_reaction`` в MAX через ``pymax.Client``.
+      Источник — Telegram-хэндлер ``MessageReactionUpdated`` (TG → MAX).
+      ``op`` здесь ``"add"`` или ``"remove"``, ``emoji`` непустой.
+      ``max_chat_id`` / ``max_message_id`` обязательны.
+
+    * ``"to_tg"``           — задача для бота: поставить реакцию ботом
+      (``setMessageReaction``) в TG на TG-сообщение, соответствующее
+      MAX-сообщению. Источник — ``on_reaction_update`` в MAX-процессе,
+      когда владелец моста сменил свою реакцию в MAX. ``op`` ``"add"`` /
+      ``"remove"``, ``emoji`` непустой. ``tg_chat_id`` /
+      ``tg_thread_id`` / ``tg_message_id`` обязательны.
+
+    * ``"to_tg_summary"``   — задача для бота: обновить сводку
+      «👍×3 🔥×1 · итого 4» под входящим из MAX сообщением в топике
+      (только для CHAT/CHANNEL). ``op`` здесь всегда ``"summary_update"``,
+      ``counters_json`` — JSON со списком ``[{reaction, count}, ...]``,
+      ``total_count`` — сумма. ``tg_chat_id`` / ``tg_thread_id`` /
+      ``tg_message_id`` обязательны; ``tg_summary_message_id`` будет
+      создан или переиспользован воркером бота.
+
+    ``status`` — ``"pending"`` / ``"in_progress"`` / ``"done"`` /
+    ``"failed"``. ``error`` — текст ошибки для ``failed``.
+    """
+
+    __tablename__ = "reaction_ops_queue"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # "to_max" | "to_tg" | "to_tg_summary".
+    direction = Column(String, nullable=False, index=True)
+    # "add" | "remove" | "summary_update".
+    op = Column(String, nullable=False, index=True)
+    # --- MAX-идентификаторы (заполняются всегда) ---
+    max_chat_id = Column(String, index=True, nullable=True)
+    max_message_id = Column(String, index=True, nullable=True)
+    # --- TG-идентификаторы (заполняются для to_tg / to_tg_summary) ---
+    tg_chat_id = Column(Integer, nullable=True, index=True)
+    tg_thread_id = Column(Integer, nullable=True)
+    tg_message_id = Column(Integer, nullable=True)
+    # --- Параметры ---
+    emoji = Column(String, nullable=True)
+    counters_json = Column(Text, nullable=True)
+    total_count = Column(Integer, nullable=True)
+    # --- Жизненный цикл ---
+    status = Column(String, nullable=False, default="pending", index=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
     attempts = Column(Integer, nullable=False, default=0)
