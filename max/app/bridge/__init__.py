@@ -38,6 +38,8 @@ from pymax.types.domain.attachments import (
 )
 from pymax.types.domain.enums import ChatType
 from pymax.types.events import ReactionUpdateEvent
+from pymax.protocol import InboundFrame
+from pymax.dispatch.enums import EventType
 
 from app.bridge.chats import chat_to_dict, display_name_of
 from app.bridge.media import process_file, process_photo, process_video
@@ -46,6 +48,32 @@ from app.bridge.users import user_display_name
 from app.pymax_patches import apply as apply_pymax_patches
 
 logger = logging.getLogger(__name__)
+
+
+def _event_map_has_reaction_changed() -> bool:
+    """Проверить, что в ``EVENT_MAP`` есть opcode реакции сообщения."""
+    try:
+        from pymax.dispatch import mapping as dispatch_mapping
+        from pymax.protocol import Opcode
+        opcode = getattr(Opcode, "NOTIF_MSG_REACTIONS_CHANGED", None)
+        if opcode is None:
+            return False
+        return opcode in dispatch_mapping.EVENT_MAP
+    except Exception:
+        return False
+
+
+def _event_map_has_you_reacted() -> bool:
+    """Проверить, что в ``EVENT_MAP`` есть opcode своей реакции."""
+    try:
+        from pymax.dispatch import mapping as dispatch_mapping
+        from pymax.protocol import Opcode
+        opcode = getattr(Opcode, "NOTIF_MSG_YOU_REACTED", None)
+        if opcode is None:
+            return False
+        return opcode in dispatch_mapping.EVENT_MAP
+    except Exception:
+        return False
 
 
 async def _post(path: str, json: dict = None) -> None:
@@ -71,6 +99,52 @@ def register_bridge(client) -> None:
     @client.on_start()
     async def _on_start(client) -> None:
         await on_start_actions(client)
+
+    # Логируем все входящие RAW-фреймы, в opcode которых есть подстрока
+    # "REACT" — чтобы понять, какие именно события о реакциях шлёт
+    # MAX-сервер. Если фреймов нет в потоке — сервер не отправляет события
+    # о реакциях (нужно пересоздать подписку / long-poll).
+    @client.on_raw()
+    async def _on_raw_reaction_trace(frame: InboundFrame, client) -> None:
+        opcode = getattr(frame, "opcode", None)
+        op_str = str(opcode).upper() if opcode is not None else ""
+        if "REACT" not in op_str:
+            return
+        try:
+            payload_repr = repr(frame.payload)[:600] if frame.payload else "None"
+        except Exception as exc:
+            payload_repr = f"<unreprable: {exc}>"
+        logger.info(
+            "raw.reaction frame: opcode=%s cmd=%s seq=%s payload=%s",
+            opcode,
+            getattr(frame, "cmd", "?"),
+            getattr(frame, "seq", "?"),
+            payload_repr,
+        )
+
+    # Факт регистрации хендлеров — для отладки.
+    try:
+        router = getattr(client, "root_router", None) or getattr(
+            getattr(client, "dispatcher", None), "root_router", None
+        )
+        handlers_map = getattr(router, "handlers", {}) if router else {}
+        logger.info(
+            "register_bridge: handlers registered: "
+            "on_start=%s on_chat_update=%s on_message=%s "
+            "on_reaction_update=%s on_raw=%s "
+            "EVENT_MAP contains REACTION_UPDATE-resolvable opcodes: "
+            "MSG_REACTIONS_CHANGED=%s MSG_YOU_REACTED=%s",
+            getattr(client, "on_start_handler", None) is not None,
+            bool(handlers_map.get(EventType.CHAT_UPDATE)),
+            bool(handlers_map.get(EventType.MESSAGE_NEW)),
+            bool(handlers_map.get(EventType.REACTION_UPDATE)),
+            bool(handlers_map.get(EventType.RAW)),
+            "yes" if _event_map_has_reaction_changed() else "no",
+            "yes" if _event_map_has_you_reacted() else "no",
+        )
+    except Exception as exc:
+        logger.debug("register_bridge: handler count log failed: %s", exc)
+
 
     @client.on_chat_update()
     async def _on_chat_update(chat: MaxChat, client) -> None:

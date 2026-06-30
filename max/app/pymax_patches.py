@@ -65,9 +65,11 @@ def apply() -> None:
         logger.debug("pymax_patches.apply: already applied, skipping")
         return
     _patch_reaction_message_id_int()
+    _patch_event_map_you_reacted()
     _APPLIED = True
     logger.info(
-        "pymax_patches.apply: applied (reaction message_id → int)",
+        "pymax_patches.apply: applied (reaction message_id → int, "
+        "EVENT_MAP[NOTIF_MSG_YOU_REACTED] → REACTION_UPDATE)",
     )
 
 
@@ -168,3 +170,50 @@ def _parse_reaction_info(app, response: Any) -> Optional[Any]:
             exc,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Patch 2: dispatch EVENT_MAP → NOTIF_MSG_YOU_REACTED → REACTION_UPDATE
+# ---------------------------------------------------------------------------
+
+
+def _patch_event_map_you_reacted() -> None:
+    """PyMax 2.2.0: ``Opcode.NOTIF_MSG_YOU_REACTED`` отсутствует в ``EVENT_MAP``.
+
+    Вендорный ``mapping.EVENT_MAP`` содержит только:
+        Opcode.NOTIF_MSG_REACTIONS_CHANGED → resolve_reaction_update
+
+    Но MAX-сервер на собственную реакцию пользователя (владельца моста)
+    шлёт **отдельное** событие с opcode=156 (``NOTIF_MSG_YOU_REACTED``),
+    а не ``NOTIF_MSG_REACTIONS_CHANGED``. Без этого патча dispatcher
+    не может зарезолвить фрейм и сбрасывает его в ``on_raw`` —
+    обработчик ``on_reaction_update`` никогда не вызывается, и
+    мост не зеркалит реакции владельца в Telegram.
+
+    Решение: добавляем ``NOTIF_MSG_YOU_REACTED`` → ``resolve_reaction_update``
+    в вендорный ``EVENT_MAP``. После фикса upstream этот патч можно
+    просто удалить.
+    """
+    from pymax.dispatch import mapping as dispatch_mapping
+    from pymax.protocol import Opcode
+
+    opcode = getattr(Opcode, "NOTIF_MSG_YOU_REACTED", None)
+    if opcode is None:
+        logger.warning(
+            "pymax_patches: Opcode.NOTIF_MSG_YOU_REACTED not found, skipping",
+        )
+        return
+
+    event_map = dispatch_mapping.EVENT_MAP
+    if opcode in event_map:
+        logger.debug(
+            "pymax_patches: EVENT_MAP already has NOTIF_MSG_YOU_REACTED, "
+            "skipping",
+        )
+        return
+
+    event_map[opcode] = dispatch_mapping.resolve_reaction_update
+    logger.info(
+        "pymax_patches: EVENT_MAP[NOTIF_MSG_YOU_REACTED] → "
+        "resolve_reaction_update (registered)",
+    )
