@@ -247,6 +247,14 @@ def register_bridge(client) -> None:
             chat_id_str = str(event.chat_id)
             msg_id_str = str(event.message_id)
 
+            logger.info(
+                "bridge.on_reaction_update: event received chat=%s msg=%s "
+                "counters=%s total=%d",
+                chat_id_str, msg_id_str,
+                [getattr(c, "reaction", "?") for c in (event.counters or [])],
+                int(getattr(event, "total_count", 0) or 0),
+            )
+
             # 1) Сводка по счётчикам — кидаем всегда, когда MAX прислал
             #    ненулевой апдейт. Бот сам разберётся: если это ЛС или
             #    сообщение ещё не доставлено в TG — пропустит.
@@ -266,6 +274,11 @@ def register_bridge(client) -> None:
                         "counters_json": json.dumps(counters, ensure_ascii=False),
                         "total_count": total,
                     },
+                )
+                logger.info(
+                    "bridge.on_reaction_update: enqueued summary_update "
+                    "chat=%s msg=%s counters=%s total=%d",
+                    chat_id_str, msg_id_str, counters, total,
                 )
 
             # 2) Зеркальная реакция владельца: узнаём ``your_reaction``.
@@ -288,8 +301,20 @@ def register_bridge(client) -> None:
                 ri = reactions_map.get(str(event.message_id))
                 if ri is not None:
                     your_reaction = getattr(ri, "your_reaction", None)
+            logger.info(
+                "bridge.on_reaction_update: your_reaction=%r reactions_map=%s "
+                "chat=%s msg=%s",
+                your_reaction,
+                bool(reactions_map),
+                chat_id_str, msg_id_str,
+            )
             if not your_reaction:
                 # Нет своей реакции у владельца моста — зеркалить нечего.
+                logger.info(
+                    "bridge.on_reaction_update: no your_reaction, skip to_tg "
+                    "chat=%s msg=%s total=%d",
+                    chat_id_str, msg_id_str, total,
+                )
                 return
             await _post(
                 "/reaction_ops",
@@ -302,8 +327,8 @@ def register_bridge(client) -> None:
                 },
             )
             logger.info(
-                "on_reaction_update: mirrored your_reaction=%s chat=%s msg=%s",
-                your_reaction, chat_id_str, msg_id_str,
+                "bridge.on_reaction_update: enqueued to_tg add chat=%s msg=%s emoji=%s",
+                chat_id_str, msg_id_str, your_reaction,
             )
         except Exception as exc:
             logger.exception("on_reaction_update handler failed: %s", exc)

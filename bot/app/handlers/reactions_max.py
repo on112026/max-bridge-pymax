@@ -96,6 +96,12 @@ class ReactionsMaxPoller:
         except Exception as exc:
             logger.warning("reactions poller: list to_tg failed: %s", exc)
             tg_items = []
+        if tg_items:
+            logger.info(
+                "rx.tick: claimed %d to_tg ops (cursor=%d): ids=%s",
+                len(tg_items), self._cursor_to_tg,
+                [int(it.get("id") or 0) for it in tg_items],
+            )
         for item in tg_items:
             await self._apply_tg_reaction(item)
             try:
@@ -119,6 +125,12 @@ class ReactionsMaxPoller:
         except Exception as exc:
             logger.warning("reactions poller: list to_tg_summary failed: %s", exc)
             sum_items = []
+        if sum_items:
+            logger.info(
+                "rx.tick: claimed %d to_tg_summary ops (cursor=%d): ids=%s",
+                len(sum_items), self._cursor_summary,
+                [int(it.get("id") or 0) for it in sum_items],
+            )
         for item in sum_items:
             await self._apply_summary(item)
             try:
@@ -149,6 +161,12 @@ class ReactionsMaxPoller:
                 "reactions poller: skip item without tg ids: %r", item,
             )
             return
+        logger.info(
+            "rx: calling setMessageReaction chat=%s msg=%s op=%s emoji=%s "
+            "(reaction payload=%s)",
+            tg_chat_id, tg_message_id, op, emoji,
+            [{"type": "emoji", "emoji": emoji}] if (op == "add" and emoji) else [],
+        )
         try:
             if op == "add" and emoji:
                 await self.bot(SetMessageReaction(
@@ -169,9 +187,10 @@ class ReactionsMaxPoller:
         except Exception as exc:
             # Тихий fail — если бот не админ с правом reactions или
             # метод недоступен — пишем debug, не warning.
-            logger.debug(
-                "reactions poller: setMessageReaction failed msg=%s: %s",
-                tg_message_id, exc,
+            logger.warning(
+                "reactions poller: setMessageReaction failed "
+                "chat=%s msg=%s op=%s emoji=%s: %s",
+                tg_chat_id, tg_message_id, op, emoji, exc,
             )
 
     async def _apply_summary(self, item: Dict[str, Any]) -> None:

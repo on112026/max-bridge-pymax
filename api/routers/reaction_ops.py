@@ -120,6 +120,14 @@ def post_reaction_op(item: ReactionOpEnqueueIn) -> ReactionOpEnqueueOut:
         item_id = db.enqueue_reaction_op(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    logger.info(
+        "api: enqueued reaction_op id=%s dir=%s op=%s "
+        "max=%s/%s tg=%s/%s/%s emoji=%s total=%d",
+        item_id, direction, item.op,
+        item.max_chat_id, item.max_message_id,
+        item.tg_chat_id, item.tg_thread_id, item.tg_message_id,
+        item.emoji, int(item.total_count or 0),
+    )
     return ReactionOpEnqueueOut(id=item_id, direction=direction, op=item.op)
 
 
