@@ -47,8 +47,59 @@ from app.bridge.media import process_file, process_photo, process_video
 from app.bridge.on_start import on_start_actions
 from app.bridge.users import user_display_name
 from app.pymax_patches import apply as apply_pymax_patches
+from shared import db as shared_db
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_chat_type(client, chat_id: Any) -> Optional[ChatType]:
+    """Определить :class:`ChatType` MAX-чата по ``chat_id``.
+
+    Используется в ``_on_reaction_update``, чтобы выбрать стратегию
+    зеркалирования реакций в TG:
+
+    * ``DIALOG`` — мост зеркалит в TG **любую** реакцию оппонента
+      (берёт первую эмодзи из ``counters``), потому что в ЛС моста
+      «владелец ↔ оппонент» реакции владельца в MAX — это единственные
+      реакции, которые есть смысл отражать в TG.
+    * ``CHAT`` / ``CHANNEL`` — мост НЕ зеркалит «свои» реакции
+      (для группы в MAX с десятками участников это бессмысленно),
+      а только сводку ``to_tg_summary`` под исходным сообщением.
+
+    Сначала смотрим локальный кеш ``client.chats`` (заполняется на
+    ``on_start`` через ``fetch_chats``), иначе — догружаем чат
+    с сервера ``client.get_chat(int(chat_id))``. Если ничего не
+    вышло — возвращаем ``None`` (хендлер должен в этом случае
+    остаться на старом пути «your_reaction / get_reactions»).
+    """
+    try:
+        cached = getattr(client, "chats", None)
+        if isinstance(cached, list):
+            cid_int = int(chat_id) if chat_id is not None else None
+            for c in cached:
+                try:
+                    if cid_int is not None and int(getattr(c, "id", 0)) == cid_int:
+                        ct = getattr(c, "type", None)
+                        if ct is not None:
+                            return ct
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.debug(
+            "_resolve_chat_type: client.chats lookup failed for %s: %s",
+            chat_id, exc,
+        )
+    # Fallback: ``get_chat`` с сервера.
+    try:
+        if hasattr(client, "get_chat") and chat_id is not None:
+            chat_obj = client.get_chat(int(chat_id))
+            return getattr(chat_obj, "type", None)
+    except Exception as exc:
+        logger.info(
+            "_resolve_chat_type: get_chat(%s) failed: %s",
+            chat_id, exc,
+        )
+    return None
 
 
 def _event_map_has_reaction_changed() -> bool:
@@ -370,17 +421,27 @@ def register_bridge(client) -> None:
     async def _on_reaction_update(event: ReactionUpdateEvent, client) -> None:
         """Прокидываем обновления реакций из MAX в мост.
 
-        Два независимых потока:
+        Три независимых потока:
 
         1. ``to_tg_summary`` — сводка «👍×N 🔥×M · итого K» под
            входящим сообщением из MAX в топике супергруппы. Используется
            ВСЕМИ реакциями в группе/канале (включая чужие). В ЛС не нужно —
            владелец видит только свою реакцию через ``setMessageReaction``.
 
-        2. ``to_tg`` — точная зеркальная реакция бота в TG на ту же
-           эмодзи, которую поставил владелец моста в MAX (через
-           ``client.get_reactions`` узнаём ``your_reaction``). Если
-           владелец ничего не ставил — задача не создаётся.
+        2. ``to_tg`` для DIALOG — точная зеркальная реакция оппонента в ЛС
+           (берём первую эмодзи из ``counters``). В DIALOG моста MAX ↔ TG
+           (владелец ↔ оппонент) бот в TG ставит ту же эмодзи, что поставил
+           оппонент в MAX: так в TG-топике видно «лайкнул ли меня собеседник».
+           Дополнительно: если в MAX реакцию сняли (``counters=[]``,
+           ``total=0``) — бот снимает свою зеркальную реакцию в TG
+           (``op=remove``). Реализовано без state, что для DIALOG эквивалентно
+           «помнить какую эмодзи бот ставил» (в DIALOG оппонент в принципе
+           может поставить только одну эмодзи на сообщение).
+
+        3. ``to_tg`` для CHAT/CHANNEL (старый путь) — точная зеркальная
+           реакция бота в TG на ту же эмодзи, которую поставил владелец
+           моста в MAX (через ``client.get_reactions`` узнаём ``your_reaction``).
+           Если владелец ничего не ставил — задача не создаётся.
         """
         try:
             chat_id_str = str(event.chat_id)
@@ -420,9 +481,101 @@ def register_bridge(client) -> None:
                     chat_id_str, msg_id_str, counters, total,
                 )
 
-            # 2) Зеркальная реакция владельца: узнаём ``your_reaction``.
-            #    Если MAX-сервер не возвращает нашу реакцию (None) — задачу
-            #    не создаём (бот ранее уже мог снять свою через ``to_max``).
+            # 2/3) Выбор ветки зеркалирования в TG.
+            # Определяем тип чата: DIALOG → зеркалим оппонента (ветка 2),
+            # CHAT/CHANNEL → зеркалим только свою реакцию (ветка 3).
+            # ``_resolve_chat_type`` сперва смотрит ``client.chats``,
+            # затем — ``client.get_chat``. Если определить не удалось —
+            # остаёмся на старом пути «your_reaction» (безопасно).
+            chat_type = _resolve_chat_type(client, event.chat_id)
+            is_dialog = (chat_type == ChatType.DIALOG)
+            logger.info(
+                "bridge.on_reaction_update: chat_type=%s is_dialog=%s "
+                "chat=%s msg=%s",
+                chat_type, is_dialog, chat_id_str, msg_id_str,
+            )
+
+            if is_dialog:
+                # Ветка DIALOG: зеркалим первую эмодзи из counters.
+                # ``to_tg`` handler в боте (``_apply_tg_reaction``) требует
+                # ``tg_chat_id`` и ``tg_message_id`` — иначе skip, поэтому
+                # заранее резолвим их через ``DeliveredMessage`` (тот же
+                # путь, что и для ``to_tg_summary``).
+                tg_chat_id: Optional[int] = None
+                tg_message_id: Optional[int] = None
+                try:
+                    mapping = shared_db.get_delivered_by_max_message(
+                        max_chat_id=chat_id_str,
+                        max_message_id=msg_id_str,
+                    )
+                    if mapping is not None:
+                        tg_chat_id = int(mapping.tg_chat_id or 0) or None
+                        tg_message_id = int(mapping.tg_message_id or 0) or None
+                except Exception as exc:
+                    logger.debug(
+                        "on_reaction_update: get_delivered_by_max_message "
+                        "failed for %s/%s: %s",
+                        chat_id_str, msg_id_str, exc,
+                    )
+                if not tg_chat_id or not tg_message_id:
+                    logger.info(
+                        "bridge.on_reaction_update: DIALOG-mirror skip, "
+                        "no DeliveredMessage chat=%s msg=%s",
+                        chat_id_str, msg_id_str,
+                    )
+                    return
+
+                if counters:
+                    first_emoji = str(counters[0].get("reaction") or "").strip()
+                    if not first_emoji:
+                        logger.info(
+                            "bridge.on_reaction_update: DIALOG-mirror skip, "
+                            "empty first emoji chat=%s msg=%s",
+                            chat_id_str, msg_id_str,
+                        )
+                        return
+                    await _post(
+                        "/reaction_ops",
+                        {
+                            "direction": "to_tg",
+                            "op": "add",
+                            "max_chat_id": chat_id_str,
+                            "max_message_id": msg_id_str,
+                            "tg_chat_id": tg_chat_id,
+                            "tg_message_id": tg_message_id,
+                            "emoji": first_emoji,
+                        },
+                    )
+                    logger.info(
+                        "bridge.on_reaction_update: DIALOG-mirror enqueued "
+                        "to_tg add chat=%s msg=%s tg=%s/%s emoji=%s",
+                        chat_id_str, msg_id_str, tg_chat_id, tg_message_id,
+                        first_emoji,
+                    )
+                else:
+                    # counters пуст → оппонент снял реакцию → снимаем
+                    # зеркальную реакцию бота в TG.
+                    await _post(
+                        "/reaction_ops",
+                        {
+                            "direction": "to_tg",
+                            "op": "remove",
+                            "max_chat_id": chat_id_str,
+                            "max_message_id": msg_id_str,
+                            "tg_chat_id": tg_chat_id,
+                            "tg_message_id": tg_message_id,
+                            "emoji": None,
+                        },
+                    )
+                    logger.info(
+                        "bridge.on_reaction_update: DIALOG-mirror enqueued "
+                        "to_tg remove chat=%s msg=%s tg=%s/%s",
+                        chat_id_str, msg_id_str, tg_chat_id, tg_message_id,
+                    )
+                return
+
+            # Ветка CHAT/CHANNEL (старая логика): зеркалим только свою
+            # реакцию (``your_reaction`` через ``get_reactions``).
             try:
                 reactions_map = await client.get_reactions(
                     chat_id=event.chat_id,
