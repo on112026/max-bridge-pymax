@@ -43,6 +43,7 @@ from app.bridge.chats import chat_to_dict, display_name_of
 from app.bridge.media import process_file, process_photo, process_video
 from app.bridge.on_start import on_start_actions
 from app.bridge.users import user_display_name
+from app.pymax_patches import apply as apply_pymax_patches
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,10 @@ async def _post(path: str, json: dict = None) -> None:
 
 def register_bridge(client) -> None:
     """Зарегистрировать обработчики на готовом client (после ``Client(...)``)."""
+    # Наложить monkey-patches на PyMax до того, как Client.start()
+    # начнёт слушать long-poll и кто-либо вызовет add_reaction /
+    # remove_reaction. См. ``max/app/pymax_patches.py``.
+    apply_pymax_patches()
 
     @client.on_start()
     async def _on_start(client) -> None:
