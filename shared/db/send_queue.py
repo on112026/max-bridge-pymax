@@ -11,6 +11,15 @@
 ``thread_id`` — id TG-топика, из которого отправлено сообщение
 (если пользователь писал из топика супергруппы). Сохраняется в
 ``SendQueue.thread_id`` для будущей синхронизации.
+
+``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого ушёл
+ответ в MAX (``message.message_id`` в aiogram). После успешной отправки
+в MAX (``client.send_message`` возвращает ``msg.id``) MAX-процесс создаёт
+``DeliveredMessage``-строку, связывающую ``(max_chat_id, max_message_id)``
+↔ ``(tg_chat_id, thread_id, tg_message_id)``. Без этого мост MAX→TG-реакций
+не может зеркалить реакции на наши же сообщения (см. ``bridge::
+_on_reaction_update`` — там логируется «DIALOG-mirror skip, no
+DeliveredMessage»).
 """
 
 from __future__ import annotations
@@ -25,7 +34,17 @@ from shared.db._models import SendQueue
 
 
 def enqueue_send(item: dict) -> int:
-    """Положить задачу в очередь отправки. Возвращает ``id`` созданной записи."""
+    """Положить задачу в очередь отправки. Возвращает ``id`` созданной записи.
+
+    Дополнительно к стандартным полям (``text``, ``media_*``, ``thread_id``)
+    можно передать:
+
+    * ``tg_chat_id``    — id TG-супергруппы, из которой отправлено сообщение
+      (топик которой = ``thread_id``). Нужен для создания ``DeliveredMessage``
+      после успешной отправки в MAX.
+    * ``tg_message_id`` — id TG-сообщения, из которого ушёл ответ
+      (``message.message_id`` в aiogram).
+    """
     with session_scope() as s:
         row = SendQueue(
             kind=item.get("kind", "text"),
@@ -40,6 +59,12 @@ def enqueue_send(item: dict) -> int:
         thread_id = item.get("thread_id")
         if thread_id is not None:
             row.thread_id = int(thread_id)
+        tg_chat_id = item.get("tg_chat_id")
+        if tg_chat_id is not None:
+            row.tg_chat_id = int(tg_chat_id)
+        tg_message_id = item.get("tg_message_id")
+        if tg_message_id is not None:
+            row.tg_message_id = int(tg_message_id)
         s.add(row)
         s.flush()
         return row.id

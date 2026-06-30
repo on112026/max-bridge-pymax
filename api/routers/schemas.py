@@ -103,6 +103,16 @@ class SendIn(BaseModel):
     # пользователь отправил сообщение. Передаётся через ``enqueue_send``
     # в ``SendQueue.thread_id`` (см. ``shared/db.py::SendQueue``).
     thread_id: Optional[int] = None
+    # ``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого
+    # ушёл ответ в MAX (``message.message_id`` в aiogram). После успешной
+    # отправки в MAX (``client.send_message`` возвращает ``msg.id``)
+    # MAX-процесс создаёт ``DeliveredMessage``-строку, связывающую
+    # ``(max_chat_id, str(msg.id))`` ↔ ``(tg_chat_id, thread_id,
+    # tg_message_id)``. Нужно для двусторонней синхронизации реакций
+    # MAX→TG на наши же сообщения (мост MAX→TG иначе логирует
+    # «DIALOG-mirror skip, no DeliveredMessage»).
+    tg_chat_id: Optional[int] = None
+    tg_message_id: Optional[int] = None
 
 
 class SendOut(BaseModel):
@@ -118,6 +128,8 @@ class SendOut(BaseModel):
     created_at: Optional[str] = None
     finished_at: Optional[str] = None
     thread_id: Optional[int] = None
+    tg_chat_id: Optional[int] = None
+    tg_message_id: Optional[int] = None
 
 
 # ---------- Status ----------

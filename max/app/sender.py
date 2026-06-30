@@ -16,6 +16,14 @@ from pymax.files import File as MaxFile
 from pymax.files import Photo as MaxPhoto
 from pymax.files import Video as MaxVideo
 
+# ``shared.db`` используется для создания ``DeliveredMessage``-записи
+# после успешной отправки в MAX: это связывает новый ``max_message_id``
+# с исходным ``tg_message_id`` из TG-топика, чтобы мост MAX→TG-реакций
+# (``bridge._on_reaction_update``) мог найти запись через
+# ``get_delivered_by_max_message`` и поставить реакцию в нужный
+# TG-топик/сообщение.
+from shared import db as shared_db
+
 logger = logging.getLogger(__name__)
 
 
@@ -89,14 +97,21 @@ async def _finish(item_id: int, ok: bool, error: Optional[str] = None) -> None:
         logger.warning("finish_send id=%s failed: %s", item_id, exc)
 
 
-async def _send_one(client, item: dict) -> tuple[bool, str | None]:
+async def _send_one(client, item: dict) -> tuple[bool, str | None, Optional[str]]:
+    """Отправить одно сообщение в MAX.
+
+    Возвращает ``(ok, error, max_message_id)``:
+    * ``max_message_id`` — id только что отправленного сообщения в MAX
+      (``str(msg.id)``), либо ``None`` при неуспехе. Нужен для создания
+      ``DeliveredMessage``-записи в :func:`shared.db.record_delivered_with_tg`.
+    """
     chat_id = item.get("target_chat_id")
     if not chat_id:
-        return False, "target_chat_id missing"
+        return False, "target_chat_id missing", None
     try:
         chat_id_int = int(chat_id)
     except ValueError:
-        return False, f"invalid target_chat_id: {chat_id}"
+        return False, f"invalid target_chat_id: {chat_id}", None
 
     text = item.get("text") or ""
     attachment = _build_attachment(item)
@@ -110,10 +125,63 @@ async def _send_one(client, item: dict) -> tuple[bool, str | None]:
             notify=True,
         )
         if msg is None:
-            return False, "send_message returned None"
-        return True, None
+            return False, "send_message returned None", None
+        # ``msg.id`` в PyMax — ``str`` вида ``"mid.123…`` (см. ``pymax.types``).
+        max_message_id = str(getattr(msg, "id", "") or "")
+        if not max_message_id:
+            return False, "send_message returned message without id", None
+        return True, None, max_message_id
     except Exception as exc:
-        return False, str(exc)
+        return False, str(exc), None
+
+
+def _maybe_record_delivered(item: dict, max_message_id: str) -> None:
+    """Создать ``DeliveredMessage``-запись для исходящего TG→MAX сообщения.
+
+    Заполняется, если ``topic_echo`` (бот) передал ``tg_chat_id`` и
+    ``tg_message_id`` в payload — это означает, что сообщение пришло из
+    конкретного TG-топика и должно быть зеркально отражено в обратную
+    сторону (MAX→TG-реакции).
+
+    ``thread_id`` хранится отдельно (``tg_thread_id``) для будущей
+    синхронизации ``chat.read_at`` с TG-топиком.
+    """
+    tg_chat_id = item.get("tg_chat_id")
+    tg_message_id = item.get("tg_message_id")
+    if tg_chat_id is None or tg_message_id is None:
+        # Исходящее сообщение без привязки к TG-топику (например, ручной
+        # POST /send без bridge-контекста) — не создаём запись, чтобы не
+        # засорять ``delivered_messages`` мусорными строками.
+        return
+    target_chat_id = str(item.get("target_chat_id") or "")
+    if not target_chat_id:
+        return
+    try:
+        thread_id = item.get("thread_id")
+        tg_thread_id = int(thread_id) if thread_id is not None else None
+        shared_db.record_delivered_with_tg(
+            max_chat_id=target_chat_id,
+            max_message_id=max_message_id,
+            tg_chat_id=int(tg_chat_id),
+            tg_thread_id=tg_thread_id,
+            tg_message_id=int(tg_message_id),
+        )
+        logger.info(
+            "delivered_mapping max_chat=%s max_msg=%s -> tg_chat=%s tg_msg=%s thread=%s",
+            target_chat_id,
+            max_message_id,
+            tg_chat_id,
+            tg_message_id,
+            tg_thread_id,
+        )
+    except Exception as exc:
+        # Не критично: основная отправка уже успешно завершена. Если
+        # запись не создастся, мост MAX→TG-реакций просто пропустит
+        # зеркалирование для этого сообщения, как и раньше.
+        logger.warning(
+            "record_delivered_with_tg failed max_msg=%s tg_msg=%s: %s",
+            max_message_id, tg_message_id, exc,
+        )
 
 
 async def sender_loop(client, stop_event) -> None:
@@ -138,9 +206,18 @@ async def sender_loop(client, stop_event) -> None:
             target_chat_id=item.get("target_chat_id", ""),
             thread_id=item.get("thread_id"),
         )
-        ok, err = await _send_one(client, item)
+        ok, err, max_message_id = await _send_one(client, item)
+        if ok and max_message_id:
+            # Связываем новое MAX-сообщение с исходным TG-сообщением из
+            # топика, чтобы мост MAX→TG-реакций мог найти запись через
+            # ``get_delivered_by_max_message`` и поставить реакцию
+            # обратно в нужный TG-топик.
+            _maybe_record_delivered(item, max_message_id)
         await _finish(item_id, ok=ok, error=err)
-        logger.info("send item id=%s ok=%s err=%s", item_id, ok, err)
+        logger.info(
+            "send item id=%s ok=%s err=%s max_msg=%s",
+            item_id, ok, err, max_message_id,
+        )
 
 
 async def asyncio_wait(stop_event, timeout: float) -> None:

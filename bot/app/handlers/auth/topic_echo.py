@@ -117,6 +117,12 @@ async def topic_message_to_max(
     max_chat_id = topic.max_chat_id
 
     # 7) Отправляем в очередь (идём по тому же пути, что и /reply).
+    # ``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого
+    # уходит ответ. MAX-процесс после ``client.send_message`` создаст
+    # ``DeliveredMessage``-строку, связывающую ``(max_chat_id, msg.id)``
+    # ↔ ``(chat.id, thread_id, message.message_id)``. Без этого мост
+    # MAX→TG-реакций не сможет найти наше TG-сообщение по ``max_message_id``
+    # (логирует «DIALOG-mirror skip, no DeliveredMessage»).
     try:
         if message.content_type == "text":
             res = await api.enqueue_send(
@@ -125,6 +131,8 @@ async def topic_message_to_max(
                 text=message.text or "",
                 created_by=message.from_user.id,
                 thread_id=int(thread_id),
+                tg_chat_id=int(chat.id),
+                tg_message_id=int(message.message_id),
             )
         else:
             file_id = None
@@ -166,11 +174,15 @@ async def topic_message_to_max(
                 media_filename=local_name,
                 created_by=message.from_user.id,
                 thread_id=int(thread_id),
+                tg_chat_id=int(chat.id),
+                tg_message_id=int(message.message_id),
             )
         logger.info(
-            "topic_echo: enqueued send id=%s chat=%s thread=%s from uid=%s",
+            "topic_echo: enqueued send id=%s chat=%s thread=%s from uid=%s "
+            "tg_chat_id=%s tg_message_id=%s",
             res.get("id") if isinstance(res, dict) else res,
             max_chat_id, thread_id, message.from_user.id,
+            chat.id, message.message_id,
         )
     except Exception as exc:
         logger.warning(

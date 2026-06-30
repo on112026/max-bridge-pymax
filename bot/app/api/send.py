@@ -20,7 +20,19 @@ class SendApiMixin:
         media_filename: Optional[str] = None,
         created_by: Optional[int] = None,
         thread_id: Optional[int] = None,
+        tg_chat_id: Optional[int] = None,
+        tg_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Положить задачу в очередь отправки в MAX.
+
+        ``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого
+        ушёл ответ (``message.message_id`` в aiogram). MAX-процесс после
+        ``client.send_message`` создаст ``DeliveredMessage``-строку,
+        связывающую ``(max_chat_id, str(msg.id))`` ↔ ``(tg_chat_id,
+        thread_id, tg_message_id)``. Без этого мост MAX→TG-реакций не
+        сможет зеркалить реакции на наши же сообщения (логирует
+        «DIALOG-mirror skip, no DeliveredMessage»).
+        """
         payload = {
             "target_chat_id": target_chat_id,
             "kind": kind,
@@ -30,6 +42,8 @@ class SendApiMixin:
             "media_filename": media_filename,
             "created_by": created_by,
             "thread_id": thread_id,
+            "tg_chat_id": tg_chat_id,
+            "tg_message_id": tg_message_id,
         }
         return await self._client.enqueue_send(payload)
 

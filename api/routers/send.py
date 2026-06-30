@@ -39,6 +39,13 @@ def _send_to_out(s) -> SendOut:
         # — пробрасываем в ответ, чтобы клиент мог проверить, что поле
         # корректно сохранилось в ``SendQueue``. См. ``shared/db.py::SendQueue``.
         thread_id=s.thread_id,
+        # ``tg_chat_id`` / ``tg_message_id`` — id TG-сообщения, из которого
+        # ушёл ответ в MAX. Используется MAX-процессом для создания
+        # ``DeliveredMessage``-строки после ``client.send_message`` (иначе
+        # мост MAX→TG-реакций не сможет найти наше TG-сообщение и логирует
+        # «DIALOG-mirror skip, no DeliveredMessage»).
+        tg_chat_id=s.tg_chat_id,
+        tg_message_id=s.tg_message_id,
     )
 
 
