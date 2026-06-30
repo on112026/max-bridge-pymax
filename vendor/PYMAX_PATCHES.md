@@ -52,7 +52,40 @@ MAX-сервер по протоколу `proto.payload` ожидает `int64` 
 `apply_pymax_patches()` из `bridge/__init__.py`. Наш `reactions_loop`
 продолжит работать — патч нужен только для текущего бага.
 
-## Patch 2: (зарезервировано)
+## Patch 2: `EVENT_MAP[NOTIF_MSG_YOU_REACTED]` → `REACTION_UPDATE`
+
+**Симптом:** при постановке реакции **владельцем моста** в MAX на любое
+сообщение бот не ставит зеркальную реакцию в Telegram. В логах
+`bridge.on_reaction_update: event received …` не появляется.
+
+**Причина:** в `pymax/dispatch/mapping.py::EVENT_MAP` вендор зарегистрировал
+только один opcode для событий реакций:
+
+```python
+EVENT_MAP: dict[Opcode, Resolver] = {
+    ...
+    Opcode.NOTIF_MSG_REACTIONS_CHANGED: resolve_reaction_update,  # 155
+}
+```
+
+MAX-сервер шлёт **два** разных opcode:
+
+| opcode | имя | когда |
+|---|---|---|
+| 155 | `NOTIF_MSG_REACTIONS_CHANGED` | кто-то другой поставил реакцию (counters) |
+| 156 | `NOTIF_MSG_YOU_REACTED` | **вы сами** поставили реакцию |
+
+Без opcode 156 `EventResolver.resolve()` возвращает `None`, фрейм попадает
+только в `on_raw()`, наш `on_reaction_update()` не вызывается.
+
+**Workaround:** `_patch_event_map_you_reacted()` добавляет
+`Opcode.NOTIF_MSG_YOU_REACTED → resolve_reaction_update` в `EVENT_MAP`.
+
+**Когда удалять:** при обновлении PyMax до версии, где `EVENT_MAP` уже
+содержит `Opcode.NOTIF_MSG_YOU_REACTED` (upstream добавил). Функция
+идемпотентна — проверит наличие и пропустит.
+
+---
 
 Другие баги добавляйте здесь по мере обнаружения.
 
