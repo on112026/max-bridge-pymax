@@ -73,7 +73,11 @@ def register_bridge(client) -> None:
         await on_start_actions(client)
 
     @client.on_chat_update()
-    async def _on_chat_update(chat: MaxChat) -> None:
+    async def _on_chat_update(chat: MaxChat, client) -> None:
+        # PyMax 2.2.0 диспатчит обработчики как ``handler(event, client)``
+        # (см. ``vendor/pymax/dispatch/router.py::HandlerCallback``).
+        # ``client`` не используем, но принимаем обязательно — иначе
+        # dispatcher бросит TypeError на каждом chat update.
         try:
             await _post("/chats", chat_to_dict(chat))
         except Exception as exc:
