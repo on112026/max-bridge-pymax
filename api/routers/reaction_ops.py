@@ -167,16 +167,10 @@ def post_finish_reaction_op(
 # ---------------------------------------------------------------------------
 
 
-@router.get(
-    "/reaction_ops/{item_id}",
-    response_model=ReactionOpOut,
-    dependencies=[Depends(verify_api_key)],
-)
-def get_reaction_op(item_id: int) -> ReactionOpOut:
-    row = db.get_reaction_op(item_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="reaction_op not found")
-    return _row_to_out(row)
+# ВАЖНО: ``/reaction_ops/list`` и ``/reaction_ops/stats`` должны быть
+# зарегистрированы **до** ``/reaction_ops/{item_id}`` — иначе FastAPI
+# пытается распарсить ``list`` / ``stats`` как ``item_id: int`` и
+# возвращает ``422 Unprocessable Entity``.
 
 
 @router.get(
@@ -212,3 +206,15 @@ def list_reaction_ops(
 def get_reaction_op_stats() -> ReactionOpStatsOut:
     """Статистика очереди для ``/status`` и мониторинга."""
     return ReactionOpStatsOut(**db.reaction_ops_queue_stats())
+
+
+@router.get(
+    "/reaction_ops/{item_id}",
+    response_model=ReactionOpOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def get_reaction_op(item_id: int) -> ReactionOpOut:
+    row = db.get_reaction_op(item_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="reaction_op not found")
+    return _row_to_out(row)
