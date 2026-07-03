@@ -99,9 +99,15 @@ async def forward_event(
         header = header_override
 
     if not media_path:
+        # В compact-режиме header может быть ``""`` (топик несёт контекст).
+        # ``_caption`` уже умеет подставлять плейсхолдер, но добавим явную
+        # страховку — Telegram не примет ``send_message`` с пустым ``text``.
+        text = _caption(event, header)
+        if not text.strip():
+            text = "📎 <i>Вложение из MAX</i>"
         return await bot.send_message(
             chat_id=target_chat_id,
-            text=_caption(event, header),
+            text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=reply_markup,
@@ -110,9 +116,12 @@ async def forward_event(
 
     abs_path = _abs_media_path(media_path)
     if not os.path.exists(abs_path):
+        text = _caption(event, header) + "\n\n<i>(медиафайл не найден)</i>"
+        if not text.strip():
+            text = "📎 <i>Вложение из MAX</i>\n\n<i>(медиафайл не найден)</i>"
         return await bot.send_message(
             chat_id=target_chat_id,
-            text=_caption(event, header) + "\n\n<i>(медиафайл не найден)</i>",
+            text=text,
             parse_mode="HTML",
             reply_markup=reply_markup,
             message_thread_id=message_thread_id,

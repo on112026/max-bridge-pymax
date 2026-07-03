@@ -214,16 +214,13 @@ class EventPoller:
                     continue  # не помечаем delivered — повторим
 
                 # Compact-режим (COMPACT_TOPIC_MESSAGES=true): в топике
-                # убираем inline-кнопки (автоэхо в топике и так работает,
-                # история чата лежит в нём, ID не нужен). Шапку
-                # «💬 чат / ↘️ автор · время» больше НЕ подменяем на
-                # пустую строку — иначе ``_caption`` вернёт ``""`` для
-                # событий без текста/медиа и Telegram отобьёт запрос
-                # «message text is empty». Шапку оставляем в compact-режиме
-                # как неявный fallback, а подтверждение доставки —
-                # реакцией 📨.
+                # убираем шапку «💬 чат / ↘️ автор · время» (топик уже
+                # несёт контекст) и inline-кнопки (автоэхо в топике и так
+                # работает, история чата лежит в нём, ID не нужен).
+                # Подтверждение доставки — реакцией 📨.
                 if self._is_compact():
                     kb = None
+                    header: Optional[str] = ""
                 else:
                     # Inline-клавиатура прикрепляется прямо к сообщению
                     # с самим событием (текст/медиа), а не отдельным
@@ -235,7 +232,7 @@ class EventPoller:
                         chat_type=chat_type,
                         max_message_id=str(ev.get("max_message_id") or ""),
                     )
-                header: Optional[str] = None  # sender сам вызовет _format_header
+                    header = None  # sender сам вызовет _format_header
 
                 try:
                     sent = await forward_event(
