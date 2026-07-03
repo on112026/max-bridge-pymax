@@ -50,11 +50,20 @@ def _format_header(event: Dict[str, Any]) -> str:
 
 
 def _caption(event: Dict[str, Any], header: str) -> str:
-    text = event.get("text") or ""
-    parts = [header]
+    text = (event.get("text") or "").strip()
+    parts: list[str] = []
+    if header:
+        parts.append(header)
     if text:
-        parts.append("")
+        if parts:
+            parts.append("")
         parts.append(_escape(text[:3500]))
+    if not parts:
+        # Ни шапки, ни текста — отдаём плейсхолдер, чтобы Telegram
+        # не отбил запрос «message text is empty». Актуально для
+        # событий из MAX с пустым payload (например, медиа без caption,
+        # для которого в БД ещё не сохранился media_path).
+        parts.append("📎 <i>Вложение из MAX</i>")
     return "\n".join(parts)[:4096]
 
 
