@@ -58,7 +58,7 @@ async def main() -> None:
     poller = EventPoller(
         bot=bot,
         owner_user_id=owner_uid,
-        poll_interval=2.0,
+        poll_interval=5.0,
     )
 
     auth_watcher = AuthWatcher(bot=bot)

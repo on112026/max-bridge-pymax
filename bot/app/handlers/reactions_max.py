@@ -47,7 +47,7 @@ class ReactionsMaxPoller:
     Оба направления обходятся независимо. Если задач нет — спим.
     """
 
-    POLL_INTERVAL = 1.5
+    POLL_INTERVAL = 4.0
     TG_EDIT_LIMIT_SECONDS = 48 * 3600  # Telegram: edit < 48h
 
     def __init__(

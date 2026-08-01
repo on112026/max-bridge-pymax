@@ -33,10 +33,10 @@ SMS_RESEND_COOLDOWN = 900.0  # 15 минут
 CODE_DRAIN_INTERVAL = 0.5
 
 # Интервал опроса session-файла на диске.
-SESSION_WATCH_INTERVAL = 5.0
+SESSION_WATCH_INTERVAL = 10.0
 
 # Интервал опроса API для пометки прочитанных сообщений в MAX.
-READ_RECEIPTS_INTERVAL = 3.0
+READ_RECEIPTS_INTERVAL = 8.0
 
 
 # ---------- Распознавание ошибок ----------

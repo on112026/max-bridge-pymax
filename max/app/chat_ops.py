@@ -61,7 +61,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 # Интервал между опросами очереди (сек). Задачи редкие, можно подольше.
-POLL_INTERVAL = 2.0
+POLL_INTERVAL = 5.0
 
 # Таймаут ожидания готового Client (после старта supervisor'а).
 # Если Client ещё не поднят (``auth_required``) — задачи просто копятся в БД.

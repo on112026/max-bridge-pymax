@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 API_KEY = os.getenv("BRIDGE_API_KEY", "")
 MEDIA_DIR = os.getenv("MEDIA_DIR", "/data/media")
-POLL_INTERVAL = 2.0  # секунд между опросами
+POLL_INTERVAL = 5.0  # секунд между опросами
 
 
 def _headers() -> dict:

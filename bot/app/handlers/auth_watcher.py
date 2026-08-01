@@ -67,7 +67,7 @@ class AuthWatcher:
       владельцу.
     """
 
-    POLL_INTERVAL = 3.0
+    POLL_INTERVAL = 8.0
 
     API_ERROR_WARN_BUDGET = 3
 

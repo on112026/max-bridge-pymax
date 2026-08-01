@@ -23,6 +23,7 @@ from typing import Iterator, Optional
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from shared.db._models import AuthState, Base
 
@@ -152,6 +153,7 @@ def init_engine(db_path: str) -> None:
     _engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},
+        poolclass=NullPool,
         future=True,
     )
     Base.metadata.create_all(_engine)

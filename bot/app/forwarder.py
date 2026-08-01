@@ -37,7 +37,7 @@ class EventPoller:
         self,
         bot: Bot,
         owner_user_id: int,
-        poll_interval: float = 1.5,
+        poll_interval: float = 5.0,
     ) -> None:
         self.bot = bot
         self.owner_user_id = int(owner_user_id)

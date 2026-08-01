@@ -20,6 +20,7 @@ MAX-процесс в фоне (``app.chat_ops.chat_ops_loop``) забирает
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -218,7 +219,7 @@ def post_finish_chat_op(item_id: int, body: ChatOpFinishIn) -> ChatOpFinishOut:
     response_model=ChatOpOut,
     dependencies=[Depends(verify_api_key)],
 )
-def get_chat_op(
+async def get_chat_op(
     item_id: int,
     wait: bool = Query(default=False, description="Ждать завершения (до timeout секунд)"),
     timeout: float = Query(default=30.0, ge=0.0, le=120.0),
@@ -230,6 +231,11 @@ def get_chat_op(
     или до истечения ``timeout``. Это позволяет боту получить результат
     синхронных операций (``search_user``, ``list_join_requests``) одним
     запросом, без отдельного polling-цикла в боте.
+
+    Асинхронный ``asyncio.sleep`` вместо блокирующего ``time.sleep``:
+    ожидание не держит выделенный поток из threadpool на всё время wait
+    (до ``timeout`` секунд) — при нескольких параллельных long-poll'ах
+    это раньше могло съедать заметную часть worker-потоков uvicorn.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -240,7 +246,7 @@ def get_chat_op(
             return _row_to_out(row)
         if not wait or time.monotonic() >= deadline:
             return _row_to_out(row)
-        time.sleep(poll_interval)
+        await asyncio.sleep(poll_interval)
 
 
 @router.get(
