@@ -218,7 +218,8 @@ class EventPoller:
                 # несёт контекст) и inline-кнопки (автоэхо в топике и так
                 # работает, история чата лежит в нём, ID не нужен).
                 # Подтверждение доставки — реакцией 📨.
-                if self._is_compact():
+                if self._is_compact() and chat_type in ("DIALOG", "CHANNEL"):
+                    # Compact-режим только для личных чатов и каналов
                     kb = None
                     header: Optional[str] = ""
                 else:
