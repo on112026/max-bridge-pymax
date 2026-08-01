@@ -1,7 +1,9 @@
 name: max-bridge-pymax
 
-# docker compose для max-bridge-pymax (этап 2).
-# Один сервис, в нём через supervisord крутятся 3 процесса: api, bot, max.
+# docker compose для max-bridge-pymax (этап 3).
+# Один сервис, один Python-процесс (run_all.py): api, bot и max крутятся
+# как supervised asyncio-задачи одного event loop'а (раньше — три
+# отдельных процесса под supervisord; см. git-историю для отката).
 #
 # Поднять:
 #   cp .env.example .env   # и заполнить токены
@@ -16,15 +18,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: max-bridge-pymax:stage2
+    image: max-bridge-pymax:stage3
     container_name: max-bridge
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      # Внутри контейнера API крутится на 127.0.0.1:8000, но supervisord уже
-      # стартует все 3 процесса в одном namespace, поэтому каждый из них ходит
-      # на localhost. На всякий случай фиксируем явно:
+      # Внутри контейнера всё крутится одним процессом (run_all.py: api,
+      # bot и max — задачи одного event loop'а), поэтому каждый компонент
+      # ходит в api через localhost. На всякий случай фиксируем явно:
       API_HOST: 0.0.0.0
       API_BASE_URL: http://127.0.0.1:${API_PORT:-8000}
       DB_PATH: /data/bridge.db

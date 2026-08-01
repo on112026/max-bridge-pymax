@@ -44,28 +44,20 @@ logs: ## Трейс логов всего контейнера
 	$(COMPOSE) logs -f --tail=200
 
 .PHONY: logs-api
-logs-api: ## Логи только api-процесса (supervisor:bridge:api)
-	$(COMPOSE) exec $(SERVICE) tail -F /dev/stdout 2>/dev/null | head
+logs-api: ## Логи только api (фильтр по логгерам api.*)
+	$(COMPOSE) logs -f --tail=500 | grep -E ' (api\.|run_all)' --color=never
+
+.PHONY: logs-bot
+logs-bot: ## Логи только bot (фильтр по логгерам app.*, это namespace бота)
+	$(COMPOSE) logs -f --tail=500 | grep -E ' (app\.|aiogram)' --color=never
+
+.PHONY: logs-max
+logs-max: ## Логи только max (фильтр по логгерам maxcore.*/pymax)
+	$(COMPOSE) logs -f --tail=500 | grep -E ' (maxcore\.|pymax)' --color=never
 
 .PHONY: shell
 shell: ## Войти в bash контейнера
 	$(COMPOSE) exec $(SERVICE) bash
-
-.PHONY: supervisorctl
-supervisorctl: ## supervisorctl внутри контейнера
-	$(COMPOSE) exec $(SERVICE) supervisorctl -c /etc/supervisor/supervisord.conf
-
-.PHONY: restart-api
-restart-api: ## Перезапустить api внутри supervisord
-	$(COMPOSE) exec $(SERVICE) supervisorctl -c /etc/supervisor/supervisord.conf restart api
-
-.PHONY: restart-bot
-restart-bot: ## Перезапустить bot внутри supervisord
-	$(COMPOSE) exec $(SERVICE) supervisorctl -c /etc/supervisor/supervisord.conf restart bot
-
-.PHONY: restart-max
-restart-max: ## Перезапустить max внутри supervisord
-	$(COMPOSE) exec $(SERVICE) supervisorctl -c /etc/supervisor/supervisord.conf restart max
 
 # --- Состояние MAX ------------------------------------------------------
 
@@ -86,7 +78,7 @@ events: ## Показать последние 20 событий (входящи
 .PHONY: wipe-cache
 wipe-cache: ## Удалить кэш PyMax (== «reauth с нуля»). НЕ стирает /data.
 	$(COMPOSE) exec $(SERVICE) rm -rf /app/cache/*
-	@echo "Кэш PyMax очищен. Перезапустите: make restart-max"
+	@echo "Кэш PyMax очищен. Перезапустите контейнер: make restart"
 
 .PHONY: wipe-data
 wipe-data: ## ⚠️ Полный сброс БД и медиа

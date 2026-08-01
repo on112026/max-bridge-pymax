@@ -22,7 +22,7 @@
 
 ## Цикл-воркеры в `max/`
 
-Каждый воркер в `max/app/` повторяет один и тот же паттерн:
+Каждый воркер в `max/maxcore/` повторяет один и тот же паттерн:
 
 1. `GET /<queue>/next` — атомарно забрать следующую `pending`-задачу.
 2. Выполнить её через `pymax.Client`.
@@ -33,9 +33,9 @@
 
 | Воркер | Файл | Очередь |
 | --- | --- | --- |
-| `sender_loop` | `max/app/sender.py` | `send_queue` |
-| `chat_ops_loop` | `max/app/chat_ops.py` | `chat_ops_queue` |
-| `read_receipts_loop` | `max/app/supervisor/read_receipts.py` | `read_receipts` |
+| `sender_loop` | `max/maxcore/sender.py` | `send_queue` |
+| `chat_ops_loop` | `max/maxcore/chat_ops.py` | `chat_ops_queue` |
+| `read_receipts_loop` | `max/maxcore/supervisor/read_receipts.py` | `read_receipts` |
 
 Все три живут в supervisor-loop'е и запускаются как `asyncio.Task`.
 

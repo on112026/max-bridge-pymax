@@ -43,7 +43,7 @@ from shared import db as shared_db  # noqa: E402
 
 shared_db.init_engine(settings.db_path)
 
-from app import supervisor  # noqa: E402
+from maxcore import supervisor  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

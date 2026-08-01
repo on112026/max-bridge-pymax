@@ -11,8 +11,8 @@ max-bridge-pymax/
 ├── .gitignore
 ├── .dockerignore
 ├── requirements.txt           # общие: FastAPI, SQLAlchemy, pydantic, httpx
-├── Dockerfile                 # python:3.11-slim + supervisord
-├── supervisord.conf           # 3 процесса: api, bot, max
+├── Dockerfile                 # python:3.11-slim, один процесс (run_all.py)
+├── run_all.py                 # единая точка входа: api+bot+max в одном event loop'е
 ├── docker-compose.yaml        # один сервис, тома /data и /app/cache
 ├── Makefile                   # бытовые команды
 │
@@ -136,10 +136,10 @@ bot/app/
         └── commands.py # /setgroup, /supergroup
 ```
 
-## `max/app/` — код max-процесса
+## `max/maxcore/` — код max-процесса
 
 ```
-max/app/
+max/maxcore/
 ├── auth.py             # QueueSmsCodeProvider, QueuePasswordProvider
 ├── chat_ops.py         # chat_ops_loop (admin-операции)
 ├── config.py           # локальные настройки

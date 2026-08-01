@@ -28,10 +28,10 @@ MAX требует SMS-код (или 2FA-пароль). Мы не показы�
 
 | Где | Что делает |
 | --- | --- |
-| `max/app/auth.py` | `QueueSmsCodeProvider`, `QueuePasswordProvider` — адаптеры, которые зовут HTTP API |
-| `max/app/supervisor/client_runtime.py` | `build_client(phone, cache_dir)` — создаёт `pymax.Client` с этими провайдерами |
-| `max/app/supervisor/__init__.py` | главный supervisor-loop: реагирует на reauth |
-| `max/app/supervisor/twofa_drain.py` | дренаж in-memory очереди 2FA-кодов |
+| `max/maxcore/auth.py` | `QueueSmsCodeProvider`, `QueuePasswordProvider` — адаптеры, которые зовут HTTP API |
+| `max/maxcore/supervisor/client_runtime.py` | `build_client(phone, cache_dir)` — создаёт `pymax.Client` с этими провайдерами |
+| `max/maxcore/supervisor/__init__.py` | главный supervisor-loop: реагирует на reauth |
+| `max/maxcore/supervisor/twofa_drain.py` | дренаж in-memory очереди 2FA-кодов |
 | `api/routers/auth.py` | `/auth/2fa/request`, `/auth/2fa/{rid}` (HTTP-эндпойнты) |
 | `bot/app/handlers/auth_watcher.py` | фоновый опрос `/status`, шлёт 2fa-реквесты владельцу |
 | `bot/app/handlers/auth/auth_action.py` | inline-кнопки выбора способа авторизации (sms / session / cancel) |

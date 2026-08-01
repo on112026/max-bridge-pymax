@@ -151,9 +151,9 @@ Compact-режим действует **только** на топики supergr
   направлениями: `to_max` / `to_tg` / `to_tg_summary`. Та же таблица
   используется для трёх разных потоков, разделение — по колонке
   `direction`.
-* MAX-процесс: `on_reaction_update` в `max/app/bridge/__init__.py`
+* MAX-процесс: `on_reaction_update` в `max/maxcore/bridge/__init__.py`
   кладёт `to_tg` (your_reaction) и `to_tg_summary` (counters). Polling
-  `reactions_loop` в `max/app/reactions_loop.py` обрабатывает только
+  `reactions_loop` в `max/maxcore/reactions_loop.py` обрабатывает только
   `to_max` (через `client.add_reaction` / `remove_reaction`) и `fetch_summary`
   (через `client.get_reactions`).
 * Бот-процесс: `MessageReactionUpdated` в `bot/app/handlers/reactions_tg.py`

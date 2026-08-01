@@ -17,9 +17,11 @@ make up
 make logs
 ```
 
-Внутри одного контейнера крутятся три процесса (`api`, `bot`, `max`)
-под `supervisord`. На хосте — тома `/data` (БД + медиа) и `/app/cache`
-(сессия PyMax).
+Внутри одного контейнера крутится один Python-процесс (`run_all.py`):
+`api`, `bot` и `max` выполняются как supervised asyncio-задачи одного
+event loop'а (автоперезапуск при падении — см. `_supervise()` в
+`run_all.py`, аналог бывшего `supervisord.autorestart`). На хосте —
+тома `/data` (БД + медиа) и `/app/cache` (сессия PyMax).
 
 ### Полезные команды
 
@@ -51,13 +53,14 @@ make gen-key         # сгенерировать BRIDGE_API_KEY
    - `/data` (для SQLite + скачанных медиа),
    - `/app/cache` (для сессии PyMax).
 5. **Settings → Healthcheck Path**: `/health`.
-6. Дождаться деплоя. Логи — во вкладке **Logs** (`supervisord` сразу
-   видно).
+6. Дождаться деплоя. Логи — во вкладке **Logs** (строка `bridge starting:
+   api + bot + max in one process` сразу видно).
 7. SMS-флоу проходит так же, как локально: бот пришлёт вам код-реквест
    в Telegram.
 
 > **Только один контейнер.** Railway-сервис — это один Dockerfile, у
-> нас внутри supervisord с 3 процессами. Пробрасывать наружу порт
+> нас внутри один процесс (api+bot+max в одном event loop'е, см.
+> `run_all.py`). Пробрасывать наружу порт
 > `API_PORT` необязательно: бот ходит в API по `127.0.0.1` внутри
 > одного контейнера. Порт нужен, только если хотите смотреть
 > `/status` снаружи — тогда включите **Settings → Networking → Port**.

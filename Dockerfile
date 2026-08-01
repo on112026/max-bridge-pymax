@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# MAX → Telegram bridge (этап 2, без Playwright/Chromium/VNC).
-# Лёгкий образ: только Python + PyMax + supervisord.
+# MAX → Telegram bridge (этап 3: api+bot+max в одном процессе, без supervisord).
+# Лёгкий образ: только Python + PyMax.
 
 FROM python:3.11-slim
 
@@ -14,7 +14,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        supervisor \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,17 +33,19 @@ RUN pip install --no-cache-dir \
         -r max/requirements.txt
 
 # 2) Код проекта.
-COPY shared/ ./shared/
-COPY api/    ./api/
-COPY bot/    ./bot/
-COPY max/    ./max/
-# Главный supervisord-конфиг кладём напрямую (наш supervisord.conf — это и есть
-# «главный» файл, никаких conf.d/*.conf нам не нужно).
-COPY supervisord.conf /etc/supervisor/supervisord.conf
+COPY shared/  ./shared/
+COPY api/     ./api/
+COPY bot/     ./bot/
+COPY max/     ./max/
+COPY run_all.py ./run_all.py
 
 # Гарантируем, что нужные каталоги существуют (тома /data и /app/cache).
 RUN mkdir -p /data/media/inbox /data/cache
 
 EXPOSE 8000
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+# api + bot + max крутятся как supervised asyncio-задачи одного процесса
+# (см. run_all.py). Раньше здесь был supervisord с тремя процессами —
+# оставлен в репозитории (supervisord.conf, Dockerfile в истории git)
+# на случай отката.
+CMD ["python", "run_all.py"]
