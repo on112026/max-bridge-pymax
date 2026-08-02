@@ -2,7 +2,7 @@
 
 Хранит в D1 две вещи:
   1. Дамп основной SQLite-БД моста (bridge.db) — таблица meta_blobs, key='db'
-  2. Файл сессии PyMax (CACHE_DIR/bridge.db) — таблица meta_blobs, key='session'
+  2. Файл сессии PyMax (CACHE_DIR/bridge) — таблица meta_blobs, key='session'
 
 При рестарте Render:
   - скачивает оба blob'а из D1
@@ -27,8 +27,8 @@
 Или как модуль:
   from render_d1 import D1Store
   store = D1Store.from_env()
-  store.push_blob("session", Path("/data/cache/bridge.db"))
-  store.pull_blob("session", Path("/data/cache/bridge.db"))
+  store.push_blob("session", Path("/data/cache/bridge"))   # PyMax пишет без .db
+  store.pull_blob("session", Path("/data/cache/bridge"))   # восстанавливаем туда же
 """
 
 from __future__ import annotations
@@ -255,7 +255,13 @@ def main() -> None:
 
     db_path = Path(os.environ.get("DB_PATH", "/data/bridge.db"))
     cache_dir = Path(os.environ.get("CACHE_DIR", "/data/cache"))
-    session_path = cache_dir / "bridge.db"
+    # PyMax сохраняет сессию как CACHE_DIR/bridge (без .db расширения).
+    # При pull всегда пишем именно как "bridge" — это то, что PyMax ищет первым.
+    session_path_push = next(
+        (p for p in (cache_dir / "bridge", cache_dir / "bridge.db") if p.exists()),
+        cache_dir / "bridge",
+    )
+    session_path = cache_dir / "bridge"  # путь для pull (восстановление)
 
     if cmd == "init":
         store = _require_env()
@@ -269,8 +275,8 @@ def main() -> None:
 
     elif cmd == "push-session":
         store = _require_env()
-        ok = store.push_blob("session", session_path)
-        print(f"{'✅' if ok else '❌'} push-session: {session_path}")
+        ok = store.push_blob("session", session_path_push)
+        print(f"{'✅' if ok else '❌'} push-session: {session_path_push}")
 
     elif cmd == "push-all":
         store = _require_env()

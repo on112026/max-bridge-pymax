@@ -30,10 +30,14 @@ def _sync_once() -> tuple[bool, bool]:
     store = D1Store.from_env()
     db_path = Path(os.environ.get("DB_PATH", "/data/bridge.db"))
     cache_dir = Path(os.environ.get("CACHE_DIR", "/data/cache"))
-    session_path = cache_dir / "bridge.db"
+    # PyMax сохраняет сессию как CACHE_DIR/bridge (без .db)
+    session_path = next(
+        (p for p in (cache_dir / "bridge", cache_dir / "bridge.db") if p.exists()),
+        None,
+    )
 
     ok_db = store.push_db(db_path) if db_path.exists() else False
-    ok_session = store.push_blob("session", session_path) if session_path.exists() else False
+    ok_session = store.push_blob("session", session_path) if session_path else False
 
     return ok_db, ok_session
 

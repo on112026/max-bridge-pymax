@@ -37,7 +37,7 @@ if [ -n "$CF_ACCOUNT_ID" ] && [ -n "$CF_API_TOKEN" ] && [ -n "$CF_D1_DATABASE_ID
         echo "[render_start] ⚠️  bridge.db not in D1 — starting fresh (first run?)"
     fi
 
-    SESSION_FILE="${CACHE_DIR:-/data/cache}/bridge.db"
+    SESSION_FILE="${CACHE_DIR:-/data/cache}/bridge"
     if [ -f "$SESSION_FILE" ]; then
         SESSION_SIZE=$(wc -c < "$SESSION_FILE")
         echo "[render_start] ✅ PyMax session restored (${SESSION_SIZE} bytes) — SMS not required"
