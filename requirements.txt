@@ -18,3 +18,6 @@ httpx==0.28.1
 
 # --- Multipart для /sessions/upload (UploadFile в FastAPI) ---
 python-multipart==0.0.9
+# --- Render.com: Cloudflare D1-синхронизация (render_d1.py) ---
+# render_d1.py использует только stdlib (urllib, base64, json, sqlite3) —
+# никаких дополнительных зависимостей не нужно.

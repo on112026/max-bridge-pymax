@@ -127,6 +127,21 @@ async def main() -> None:
         asyncio.create_task(_supervise("bot", _run_bot), name="svc-bot"),
         asyncio.create_task(_supervise("max", _run_max), name="svc-max"),
     ]
+
+    # Render.com: периодическая синхронизация SQLite + сессии → Cloudflare D1
+    # Активируется если заданы CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID
+    import os as _os
+    if all(_os.environ.get(k) for k in ("CF_ACCOUNT_ID", "CF_API_TOKEN", "CF_D1_DATABASE_ID")):
+        try:
+            sys.path.insert(0, str(ROOT))
+            from render_d1_sync import d1_sync_loop
+            tasks.append(
+                asyncio.create_task(d1_sync_loop(stop_event), name="svc-d1-sync")
+            )
+            logger.info("render d1-sync task started")
+        except ImportError:
+            logger.warning("render_d1_sync not found, d1 sync disabled")
+
     stopper = asyncio.create_task(stop_event.wait(), name="stop-waiter")
 
     done, _pending = await asyncio.wait(

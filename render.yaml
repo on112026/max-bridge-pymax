@@ -1,0 +1,61 @@
+# render.yaml — деплой max-bridge-pymax на Render.com
+# Данные (SQLite + сессия PyMax) хранятся в Cloudflare D1 — бесплатно, без карты.
+#
+# Как задеплоить:
+#   1. Залить репо на GitHub
+#   2. render.com → New → Blueprint → выбрать репо
+#   3. Заполнить переменные окружения (помечены sync: false)
+
+services:
+  - type: web
+    name: max-bridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    startCommand: sh /app/render_start.sh
+    healthCheckPath: /health
+    envVars:
+      # --- Telegram ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_TG_USER_IDS
+        sync: false
+
+      # --- MAX ---
+      - key: MAX_PHONE
+        sync: false
+
+      # --- Bridge ---
+      - key: BRIDGE_API_KEY
+        sync: false
+
+      # --- Cloudflare D1 (персистентность данных и сессии) ---
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false
+      - key: CF_D1_DATABASE_ID
+        sync: false
+
+      # --- Keep-alive (заполнить после первого деплоя) ---
+      - key: RENDER_SERVICE_URL
+        sync: false      # https://max-bridge.onrender.com
+
+      # --- Пути внутри контейнера (не менять) ---
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: API_PORT
+        value: "8000"
+      - key: PORT
+        value: "8000"
+      - key: DB_PATH
+        value: /data/bridge.db
+      - key: MEDIA_DIR
+        value: /data/media
+      - key: CACHE_DIR
+        value: /data/cache
+      - key: LOG_LEVEL
+        value: INFO
+      - key: COMPACT_TOPIC_MESSAGES
+        value: "false"
+      - key: D1_SYNC_INTERVAL
+        value: "300"     # синхронизация в D1 каждые 5 минут

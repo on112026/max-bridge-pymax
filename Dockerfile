@@ -39,6 +39,12 @@ COPY bot/     ./bot/
 COPY max/     ./max/
 COPY run_all.py ./run_all.py
 
+# Render.com helpers (no-op при обычном docker-compose / Railway деплое)
+COPY render_start.sh   ./render_start.sh
+COPY render_d1.py      ./render_d1.py
+COPY render_d1_sync.py ./render_d1_sync.py
+RUN chmod +x /app/render_start.sh
+
 # Гарантируем, что нужные каталоги существуют (тома /data и /app/cache).
 RUN mkdir -p /data/media/inbox /data/cache
 

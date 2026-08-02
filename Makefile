@@ -101,6 +101,41 @@ env: ## Показать текущие .env (без секретов)
 gen-key: ## Сгенерировать BRIDGE_API_KEY
 	@openssl rand -hex 32
 
+# --- Render.com / Cloudflare D1 helpers --------------------------------
+# Перед использованием задайте в .env или окружении:
+#   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID
+#   DB_PATH (по умолчанию /data/bridge.db)
+#   CACHE_DIR (по умолчанию /data/cache)
+
+.PHONY: d1-init
+d1-init: ## Создать таблицу meta_blobs в D1 (один раз перед первым push)
+	python render_d1.py init
+
+.PHONY: d1-push-all
+d1-push-all: ## Залить bridge.db + сессию PyMax в D1 (использовать перед деплоем на Render)
+	python render_d1.py push-all
+
+.PHONY: d1-push-db
+d1-push-db: ## Залить только bridge.db в D1
+	python render_d1.py push-db
+
+.PHONY: d1-push-session
+d1-push-session: ## Залить только сессию PyMax в D1
+	python render_d1.py push-session
+
+.PHONY: d1-pull-all
+d1-pull-all: ## Скачать bridge.db + сессию из D1 локально (для проверки)
+	python render_d1.py pull-all
+
+.PHONY: d1-status
+d1-status: ## Показать что лежит в D1
+	python render_d1.py status
+
+.PHONY: d1-push-from-docker
+d1-push-from-docker: ## Залить файлы из работающего контейнера в D1
+	@echo "Копируем файлы из контейнера..."
+	@docker compose exec $(SERVICE) python /app/render_d1.py push-all
+
 # --- Полный PoC-цикл (этап 1, не для прод-использования) --------------
 
 .PHONY: poc-build

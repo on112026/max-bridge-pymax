@@ -65,6 +65,25 @@ make gen-key         # сгенерировать BRIDGE_API_KEY
 > одного контейнера. Порт нужен, только если хотите смотреть
 > `/status` снаружи — тогда включите **Settings → Networking → Port**.
 
+## Render.com
+
+Бесплатная альтернатива Railway. Деплой без карты (только email).
+
+Особенности:
+- На Free-плане нет постоянного диска — сессия PyMax хранится в
+  переменной окружения `MAX_SESSION_B64` (base64 от `bridge.db`)
+- SQLite сбрасывается при рестарте (или синхронизируется через Cloudflare R2)
+- Сервис засыпает через 15 мин без трафика — решается keep-alive пингом
+
+**Пошаговая инструкция:** [`render.md`](./render.md)
+
+Экспорт сессии для Render (после авторизации локально или на Railway):
+```bash
+make render-export-session
+# Скопируйте вывод в MAX_SESSION_B64 на Render
+```
+
 ## Дальше
 
 - Troubleshooting — [`troubleshooting.md`](./troubleshooting.md).
+- Render.com подробно — [`render.md`](./render.md).
