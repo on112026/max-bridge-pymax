@@ -87,6 +87,7 @@ from shared.db.chats import (  # noqa: F401
 from shared.db.send_queue import (  # noqa: F401
     claim_next_send,
     enqueue_send,
+    enqueue_edit,
     finish_send,
     queue_stats,
 )

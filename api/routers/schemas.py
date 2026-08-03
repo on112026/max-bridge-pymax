@@ -136,6 +136,7 @@ class SendOut(BaseModel):
     thread_id: Optional[int] = None
     tg_chat_id: Optional[int] = None
     tg_message_id: Optional[int] = None
+    target_max_message_id: Optional[str] = None  # для kind='edit'
 
 
 # ---------- Status ----------

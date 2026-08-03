@@ -46,6 +46,7 @@ def _send_to_out(s) -> SendOut:
         # «DIALOG-mirror skip, no DeliveredMessage»).
         tg_chat_id=s.tg_chat_id,
         tg_message_id=s.tg_message_id,
+        target_max_message_id=s.target_max_message_id,
     )
 
 

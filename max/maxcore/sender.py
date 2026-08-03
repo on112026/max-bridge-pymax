@@ -184,6 +184,39 @@ def _maybe_record_delivered(item: dict, max_message_id: str) -> None:
         )
 
 
+async def _edit_one(client, item: dict) -> tuple[bool, str | None]:
+    """Отредактировать уже отправленное сообщение в MAX.
+
+    Возвращает (ok, error).
+    """
+    chat_id = item.get("target_chat_id")
+    max_message_id = item.get("target_max_message_id")
+    new_text = item.get("text") or ""
+
+    if not chat_id or not max_message_id:
+        return False, "target_chat_id или target_max_message_id не задан"
+
+    try:
+        chat_id_int = int(chat_id)
+        msg_id_int = int(max_message_id)
+    except (ValueError, TypeError) as exc:
+        return False, f"некорректный id: {exc}"
+
+    try:
+        await client.edit_message(
+            chat_id=chat_id_int,
+            message_id=msg_id_int,
+            text=new_text,
+        )
+        logger.info(
+            "edit_one: edited max_chat=%s max_msg=%s text_len=%d",
+            chat_id, max_message_id, len(new_text),
+        )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 async def sender_loop(client, stop_event) -> None:
     """Основной цикл: забирает задачи и шлёт их в MAX."""
     logger.info("sender_loop started (poll=%.1fs)", POLL_INTERVAL)
@@ -199,6 +232,16 @@ async def sender_loop(client, stop_event) -> None:
         item_id = item.get("id")
         if not item_id:
             continue
+
+        kind = (item.get("kind") or "text").lower()
+
+        if kind == "edit":
+            # Редактирование существующего сообщения в MAX
+            ok, err = await _edit_one(client, item)
+            await _finish(item_id, ok=ok, error=err)
+            logger.info("send item id=%s kind=edit ok=%s err=%s", item_id, ok, err)
+            continue
+
         # ``thread_id`` (если есть) пришёл из TG-топика — логируем для
         # трассировки и будущей синхронизации ``chat.read_at`` с TG.
         _log_thread_id(

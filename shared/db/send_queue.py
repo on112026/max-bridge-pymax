@@ -65,6 +65,34 @@ def enqueue_send(item: dict) -> int:
         tg_message_id = item.get("tg_message_id")
         if tg_message_id is not None:
             row.tg_message_id = int(tg_message_id)
+        target_max_message_id = item.get("target_max_message_id")
+        if target_max_message_id is not None:
+            row.target_max_message_id = str(target_max_message_id)
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def enqueue_edit(
+    target_chat_id: str,
+    target_max_message_id: str,
+    new_text: str,
+    created_by: Optional[int] = None,
+) -> int:
+    """Поставить в очередь редактирование сообщения в MAX.
+
+    Используется когда пользователь редактирует сообщение в TG-топике.
+    sender.py заберёт задачу и вызовет client.edit_message().
+    """
+    with session_scope() as s:
+        row = SendQueue(
+            kind="edit",
+            target_chat_id=target_chat_id,
+            target_max_message_id=target_max_message_id,
+            text=new_text,
+            created_by=created_by,
+            status="pending",
+        )
         s.add(row)
         s.flush()
         return row.id

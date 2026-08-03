@@ -107,6 +107,9 @@ class SendQueue(Base):
     # «DIALOG-mirror skip, no DeliveredMessage»).
     tg_chat_id = Column(Integer, nullable=True, index=True)
     tg_message_id = Column(Integer, nullable=True)
+    # Для kind='edit': MAX message_id сообщения которое нужно отредактировать.
+    # Заполняется ботом из DeliveredMessage при TG message_edited событии.
+    target_max_message_id = Column(String, nullable=True)
 
 
 class AuthState(Base):

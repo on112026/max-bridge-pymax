@@ -56,7 +56,14 @@ if [ -n "$RENDER_SERVICE_URL" ]; then
         echo "[keep_alive] will ping ${RENDER_SERVICE_URL}/health every 10 minutes"
         sleep 45
         while true; do
-            RESULT=$(wget -qO- --timeout=10 "${RENDER_SERVICE_URL}/health" 2>/dev/null || echo "error")
+            RESULT=$(python3 -c "
+import urllib.request, sys
+try:
+    r = urllib.request.urlopen('${RENDER_SERVICE_URL}/health', timeout=10)
+    print(r.read().decode()[:50])
+except Exception as e:
+    print('error:', e)
+" 2>/dev/null)
             echo "[keep_alive] ping → $RESULT"
             sleep 600
         done

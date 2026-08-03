@@ -128,6 +128,15 @@ def register_handlers(dp: Dispatcher) -> None:
     # фильтрует по владельцу и привязанной супергруппе.
     dp.include_router(reactions_tg.router)
 
+    from app.handlers import edit_to_max
+
+    # Редактирование сообщения в TG-топике → MAX (обратная синхронизация).
+    # Только исходящие (отправленные нами) — по наличию DeliveredMessage.
+    dp.edited_message.register(
+        edit_to_max.edited_message_to_max,
+        F.func(lambda m: bool(getattr(getattr(m, "chat", None), "is_forum", False))),
+    )
+
     # ---------- «Эхо» из топика супергруппы в MAX (catch-all) ----------
     # Регистрируем ПОСЛЕДНИМ, чтобы он срабатывал только когда не сматчились
     # ни команда, ни FSM-состояние. Дополнительная проверка «наша ли это
