@@ -53,6 +53,10 @@ class Event(Base):
     delivered = Column(Boolean, default=False, index=True)
     delivered_at = Column(DateTime, nullable=True)
     raw_json = Column(Text, nullable=True)
+    # Флаг редактирования: выставляется когда MAX прислал on_message_edit.
+    # EditWorker в боте увидит строки с text_edited_at IS NOT NULL,
+    # отредактирует TG-сообщение и сбросит флаг (text_edited_at = NULL).
+    text_edited_at = Column(DateTime, nullable=True, index=True)
     __table_args__ = (
         UniqueConstraint("max_chat_id", "max_message_id", name="uq_chat_msg"),
     )

@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from shared import db
 from shared.api_auth import verify_api_key
 
-from api.routers.schemas import EventIn, EventOut, OkOut, TgMappingIn
+from api.routers.schemas import EventEditIn, EventIn, EventOut, OkOut, TgMappingIn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -149,5 +149,32 @@ def post_event_tg_mapping(event_id: int, body: TgMappingIn) -> OkOut:
     except Exception as exc:
         logger.warning(
             "record_delivered_with_tg for event %s failed: %s", event_id, exc,
+        )
+    return OkOut(ok=True)
+
+
+@router.post("/events/edit", response_model=OkOut, dependencies=[Depends(verify_api_key)])
+def post_event_edit(body: EventEditIn) -> OkOut:
+    """Обновить текст существующего события (редактирование сообщения в MAX).
+
+    MAX-процесс вызывает этот эндпоинт когда приходит on_message_edit.
+    Бот увидит обновлённый текст при следующем poll и вызовет edit_message_text.
+    Если событие ещё не доставлено — текст обновится до отправки в TG (без edit).
+    Если событие уже доставлено — бот отредактирует сообщение в TG.
+    """
+    updated_id = db.update_event_text(
+        body.max_chat_id,
+        body.max_message_id,
+        body.text,
+    )
+    if updated_id is None:
+        logger.debug(
+            "post_event_edit: no event found for chat=%s msg=%s — ignoring",
+            body.max_chat_id, body.max_message_id,
+        )
+    else:
+        logger.info(
+            "post_event_edit: updated event %s (chat=%s msg=%s)",
+            updated_id, body.max_chat_id, body.max_message_id,
         )
     return OkOut(ok=True)

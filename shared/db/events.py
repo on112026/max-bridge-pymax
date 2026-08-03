@@ -55,6 +55,53 @@ def upsert_event(event: dict) -> Optional[int]:
         return e.id
 
 
+def update_event_text(max_chat_id: str, max_message_id: str, new_text: str) -> Optional[int]:
+    """Обновить текст уже сохранённого события (редактирование сообщения в MAX).
+
+    Выставляет text_edited_at = now() как флаг для EditWorker в боте.
+    Если событие ещё не доставлено — текст обновится до отправки, флаг не нужен.
+    """
+    with session_scope() as s:
+        existing = s.execute(
+            select(Event).where(
+                Event.max_chat_id == max_chat_id,
+                Event.max_message_id == max_message_id,
+            )
+        ).scalar_one_or_none()
+        if not existing:
+            return None
+        existing.text = new_text
+        if existing.delivered:
+            existing.text_edited_at = datetime.utcnow()
+        s.flush()
+        return existing.id
+
+
+def list_pending_edits(limit: int = 50) -> list:
+    """Список событий с text_edited_at IS NOT NULL (ждут edit_message_text в TG)."""
+    with session_scope() as s:
+        rows = (
+            s.execute(
+                select(Event)
+                .where(Event.text_edited_at.isnot(None))
+                .order_by(Event.text_edited_at.asc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        s.expunge_all()
+        return list(rows)
+
+
+def clear_edit_flag(event_id: int) -> None:
+    """Сбросить флаг text_edited_at после успешного edit_message_text в TG."""
+    with session_scope() as s:
+        e = s.get(Event, event_id)
+        if e:
+            e.text_edited_at = None
+
+
 def mark_event_delivered(event_id: int) -> None:
     """Пометить событие доставленным в Telegram."""
     with session_scope() as s:

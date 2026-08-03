@@ -16,6 +16,7 @@ from aiogram import Bot, Dispatcher
 
 from app.api_client import api
 from app.config import settings
+from app.edit_worker import EditWorker
 from app.forwarder import EventPoller
 from app.handlers import AuthWatcher, register_handlers
 from app.handlers.reactions_max import ReactionsMaxPoller
@@ -73,18 +74,24 @@ async def main() -> None:
     # (``setMessageReaction`` + редактирование/создание сообщения-сводки).
     reactions_poller = ReactionsMaxPoller(bot=bot)
 
+    # Воркер редактирования: обновляет TG-сообщения когда MAX редактирует их.
+    # Нужен для стриминга ИИ-ответов и ручного редактирования сообщений.
+    edit_worker = EditWorker(bot=bot, poll_interval=2.0)
+
     try:
         if owner_uid:
             await poller.start()
         auth_watcher.start()
         topic_worker.start()
         await reactions_poller.start()
+        edit_worker.start()
         await dp.start_polling(bot)
     finally:
         await poller.stop()
         await auth_watcher.stop()
         await topic_worker.stop()
         await reactions_poller.stop()
+        await edit_worker.stop()
         with suppress(Exception):
             await api.close()
         with suppress(Exception):

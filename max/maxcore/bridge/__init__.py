@@ -417,6 +417,28 @@ def register_bridge(client) -> None:
         except Exception as exc:
             logger.exception("on_message handler failed: %s", exc)
 
+    @client.on_message_edit()
+    async def _on_message_edit(message: MaxMessage, client) -> None:
+        """Редактирование сообщения в MAX → обновляем текст в БД → бот правит TG.
+
+        Вызывается при стриминге ИИ-ответов и при ручном редактировании.
+        """
+        try:
+            chat_id = str(message.chat_id)
+            msg_id = str(message.id)
+            new_text = message.text or ""
+            logger.info(
+                "message_edit: chat=%s msg=%s text_len=%d",
+                chat_id, msg_id, len(new_text),
+            )
+            await _post("/events/edit", {
+                "max_chat_id": chat_id,
+                "max_message_id": msg_id,
+                "text": new_text,
+            })
+        except Exception as exc:
+            logger.exception("on_message_edit handler failed: %s", exc)
+
     @client.on_reaction_update()
     async def _on_reaction_update(event: ReactionUpdateEvent, client) -> None:
         """Прокидываем обновления реакций из MAX в мост.

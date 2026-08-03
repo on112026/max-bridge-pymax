@@ -71,6 +71,9 @@ from shared.db.events import (  # noqa: F401
     list_undelivered_events,
     mark_event_delivered,
     upsert_event,
+    update_event_text,
+    list_pending_edits,
+    clear_edit_flag,
 )
 
 # chats

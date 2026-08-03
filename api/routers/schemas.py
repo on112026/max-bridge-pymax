@@ -39,6 +39,12 @@ class EventIn(BaseModel):
     is_outgoing: bool = False
 
 
+class EventEditIn(BaseModel):
+    max_chat_id: str
+    max_message_id: str
+    text: str  # новый текст после редактирования
+
+
 class EventOut(BaseModel):
     id: int
     max_chat_id: str
