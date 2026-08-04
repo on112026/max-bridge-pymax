@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, TypeAlias
 
 from pymax.api.binding import bind_api_model, bind_api_models
@@ -35,6 +36,9 @@ from .payloads import (
     ChatHistoryPayload,
     DeleteMessagePayload,
     EditMessagePayload,
+    ForwardLink,
+    ForwardMessagePayload,
+    ForwardMessagePayloadMessage,
     GetFilePayload,
     GetMessagesPayload,
     GetReactionsPayload,
@@ -52,7 +56,7 @@ if TYPE_CHECKING:
     from pymax.app import App
 
 SendAttachment: TypeAlias = Photo | File | Video
-SendAttachments: TypeAlias = list[SendAttachment] | None
+SendAttachments: TypeAlias = Sequence[SendAttachment] | None
 
 logger = get_logger(__name__)
 
@@ -138,6 +142,42 @@ class MessageService:
         logger.info("message sent chat_id=%s", chat_id)
         return message
 
+    async def forward_message(
+        self,
+        chat_id: int,
+        message_id: int | str,
+        source_chat_id: int | None = None,
+        *,
+        notify: bool = True,
+    ) -> Message | None:
+        source_chat_id = chat_id if source_chat_id is None else source_chat_id
+        logger.info(
+            "forwarding message source_chat_id=%s chat_id=%s message_id=%s",
+            source_chat_id,
+            chat_id,
+            message_id,
+        )
+
+        frame = ForwardMessagePayload(
+            chat_id=chat_id,
+            message=ForwardMessagePayloadMessage(
+                cid=-self._next_cid(),
+                link=ForwardLink(
+                    message_id=str(message_id),
+                    chat_id=source_chat_id,
+                ),
+            ),
+            notify=notify,
+        )
+
+        response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+        message = bind_api_model(
+            self.app,
+            require_payload_model(response, Message),
+        )
+        logger.info("message forwarded source_chat_id=%s chat_id=%s", source_chat_id, chat_id)
+        return message
+
     async def get_messages(
         self,
         chat_id: int,
@@ -169,24 +209,15 @@ class MessageService:
         chat_id: int,
         message_id: int,
         text: str,
-        attachment: SendAttachment | None = None,
         attachments: SendAttachments = None,
     ) -> Message:
-        if attachment is not None and attachments:
-            logger.warning("both attachment and attachments provided; using attachments")
-            attachment = None
-
-        edit_attachments = attachments
-        if attachment is not None:
-            edit_attachments = [attachment]
-
         clean_text, elements = Formatter.format_markdown(text)
         frame = EditMessagePayload(
             chat_id=chat_id,
             message_id=message_id,
             text=clean_text,
             elements=elements,
-            attachments=await self._upload_attachments(edit_attachments),
+            attachments=await self._upload_attachments(attachments),
         )
 
         response = await self.app.invoke(Opcode.MSG_EDIT, frame.to_payload())

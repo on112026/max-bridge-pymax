@@ -194,6 +194,17 @@ class SessionStore:
         await conn.commit()
         logger.info("session deleted")
 
+    async def delete_all_sessions(self) -> None:
+        conn = await self._get_connection()
+        logger.warning("deleting all sessions")
+        await conn.execute(
+            """
+            DELETE FROM sessions
+            """
+        )
+        await conn.commit()
+        logger.info("all sessions deleted")
+
     async def update_token(self, old_token: str, new_token: str) -> None:
         conn = await self._get_connection()
         logger.debug(

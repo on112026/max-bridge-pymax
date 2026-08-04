@@ -1,5 +1,5 @@
 from pymax.api.messages.enums import ItemType
-from pymax.api.messages.service import SendAttachment, SendAttachments
+from pymax.api.messages.service import SendAttachments
 from pymax.types import (
     FileRequest,
     Message,
@@ -62,6 +62,33 @@ class MessageMixin(IClientProtocol):
             message_id=message_id,
         )
 
+    async def forward_message(
+        self,
+        chat_id: int,
+        message_id: int | str,
+        source_chat_id: int | None = None,
+        *,
+        notify: bool = True,
+    ) -> Message | None:
+        """Пересылает существующее сообщение в чат.
+
+        Args:
+            chat_id: ID целевого чата.
+            message_id: ID пересылаемого сообщения.
+            source_chat_id: ID исходного чата. Если не указан, используется
+                целевой чат.
+            notify: Отправить ли получателям push-уведомление.
+
+        Returns:
+            Пересланное сообщение или ``None``, если сервер не вернул его.
+        """
+        return await self._app.api.messages.forward_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            source_chat_id=source_chat_id,
+            notify=notify,
+        )
+
     async def get_messages(
         self,
         chat_id: int,
@@ -86,7 +113,6 @@ class MessageMixin(IClientProtocol):
         chat_id: int,
         message_id: int,
         text: str,
-        attachment: SendAttachment | None = None,
         attachments: SendAttachments = None,
     ) -> Message:
         """Редактирует текст и вложения сообщения.
@@ -95,9 +121,7 @@ class MessageMixin(IClientProtocol):
             chat_id: ID чата.
             message_id: ID сообщения.
             text: Новый текст сообщения с поддержкой markdown.
-            attachment: Одно новое вложение.
-            attachments: Список новых вложений. Имеет приоритет над
-                ``attachment``.
+            attachments: Новые файлы, фотографии или видео для сообщения.
 
         Returns:
             Отредактированное сообщение.
@@ -106,7 +130,6 @@ class MessageMixin(IClientProtocol):
             chat_id=chat_id,
             message_id=message_id,
             text=text,
-            attachment=attachment,
             attachments=attachments,
         )
 

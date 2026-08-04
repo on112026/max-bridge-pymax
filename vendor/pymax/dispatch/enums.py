@@ -14,3 +14,4 @@ class EventType(str, Enum):
     VIDEO_READY = "video_ready"
     FILE_READY = "file_ready"
     RAW = "raw"
+    ON_START = "on_start"

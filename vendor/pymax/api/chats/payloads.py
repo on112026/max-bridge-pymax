@@ -115,3 +115,9 @@ class JoinRequestActionPayload(CamelModel):
     type: str = "JOIN_REQUEST"  # TODO: ENUMM!!!
     show_history: bool | None = True
     operation: ChatMemberOperation
+
+
+class DeleteChatPayload(CamelModel):
+    chat_id: int
+    last_event_time: int
+    for_all: bool = True

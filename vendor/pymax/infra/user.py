@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pymax.types import Session, User
+from pymax.types import ContactInfo, Session, User
 
 from .protocol import IClientProtocol
 
@@ -93,6 +93,17 @@ class UserMixin(IClientProtocol):
             ``True``, если сервер принял запрос.
         """
         return await self._app.api.users.remove_contact(contact_id)
+
+    async def import_contacts(self, contacts: list[ContactInfo]) -> list[User]:
+        """Импортирует контакты из телефонной книги.
+
+        Args:
+            contacts: Контакты с телефоном и именем.
+
+        Returns:
+            Контакты Max, найденные или созданные сервером.
+        """
+        return await self._app.api.users.import_contacts(contacts)
 
     def get_chat_id(self, first_user_id: int, second_user_id: int) -> int:
         """Вычисляет ID личного чата для пары пользователей.

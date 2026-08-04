@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Annotated, Any, TypeAlias
 
 from pydantic import Field, PrivateAttr, model_validator
@@ -42,7 +43,7 @@ KnownAttachment: TypeAlias = Annotated[
 ]
 Attachment: TypeAlias = KnownAttachment | UnknownAttachment
 SendAttachment: TypeAlias = Photo | File | Video
-SendAttachments: TypeAlias = list[SendAttachment] | None
+SendAttachments: TypeAlias = Sequence[SendAttachment] | None
 
 
 class ReactionCounter(CamelModel):
@@ -92,8 +93,9 @@ class Message(CamelModel):
 
     Сообщения, полученные через клиент, обычно уже привязаны к сервису
     сообщений. После этого можно вызывать удобные методы объекта:
-    :meth:`reply`, :meth:`answer`, :meth:`edit`, :meth:`pin`, :meth:`delete`,
-    :meth:`read`, :meth:`react`, :meth:`unreact` и :meth:`get_reactions`.
+    :meth:`reply`, :meth:`answer`, :meth:`forward`, :meth:`edit`, :meth:`pin`,
+    :meth:`delete`, :meth:`read`, :meth:`react`, :meth:`unreact` и
+    :meth:`get_reactions`.
 
     Используйте ``Message`` в обработчиках ``on_message`` и при работе с
     историей. Некоторые поля могут быть ``None``, потому что Max присылает
@@ -243,6 +245,32 @@ class Message(CamelModel):
             notify=notify,
         )
 
+    async def forward(
+        self,
+        chat_id: int,
+        *,
+        notify: bool = True,
+    ) -> Message | None:
+        """Пересылает это сообщение в другой чат.
+
+        :param chat_id: ID целевого чата.
+        :type chat_id: int
+        :param notify: Отправить ли получателям push-уведомление.
+        :type notify: bool
+        :returns: Пересланное сообщение или ``None``, если сервер его не вернул.
+        :rtype: Message | None
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, source_chat_id = self._bound()
+
+        return await actions.forward_message(
+            chat_id=chat_id,
+            message_id=self.id,
+            source_chat_id=source_chat_id,
+            notify=notify,
+        )
+
     async def pin(self, notify_pin: bool = True) -> bool:
         """Закрепляет это сообщение в чате.
 
@@ -264,17 +292,13 @@ class Message(CamelModel):
     async def edit(
         self,
         text: str,
-        attachment: SendAttachment | None = None,
         attachments: SendAttachments = None,
     ) -> Message:
         """Редактирует текст и вложения этого сообщения.
 
         :param text: Новый текст сообщения с поддержкой markdown.
         :type text: str
-        :param attachment: Одно новое вложение.
-        :type attachment: SendAttachment | None
-        :param attachments: Список новых вложений. Имеет приоритет над
-            ``attachment``.
+        :param attachments: Новые файлы, фотографии или видео для сообщения.
         :type attachments: SendAttachments
         :returns: Отредактированное сообщение.
         :rtype: Message
@@ -287,7 +311,6 @@ class Message(CamelModel):
             chat_id=chat_id,
             message_id=self.id,
             text=text,
-            attachment=attachment,
             attachments=attachments,
         )
 

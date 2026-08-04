@@ -5,7 +5,8 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from uuid import uuid4
 
-from pymax.dispatch import Router
+from pymax.dispatch import ErrorScope, Router
+from pymax.dispatch.router import DisconnectDecorator, ErrorDecorator
 from pymax.infra import BaseMixin
 from pymax.logging import get_logger
 
@@ -128,6 +129,10 @@ class BaseClient(BaseMixin, ABC, Generic[ClientT]):
         while True:
             try:
                 await self._app.start()
+                if not self._app.started:
+                    await self.close()
+                    return
+
                 await self._app.dispatcher.emit_start(self)
                 await self._connection.wait_closed()
             except asyncio.CancelledError:
@@ -138,14 +143,21 @@ class BaseClient(BaseMixin, ABC, Generic[ClientT]):
                 EOFError,
                 OSError,
                 TimeoutError,
-            ):
+            ) as e:
                 await self.close()
+                await self._app.dispatcher.emit_disconnect(
+                    e,
+                    self.extra_config.reconnect,
+                    self.extra_config.reconnect_delay,
+                )
+
                 if not self.extra_config.reconnect:
                     raise
 
-                logger.exception(
+                logger.debug(
                     "client connection failed; reconnecting in %s seconds",
                     self.extra_config.reconnect_delay,
+                    exc_info=True,
                 )
                 await asyncio.sleep(self.extra_config.reconnect_delay)
                 self._reset_runtime()
@@ -237,6 +249,39 @@ class BaseClient(BaseMixin, ABC, Generic[ClientT]):
         """Регистрирует обработчик исходных входящих frame-ов."""
         return self._router.on_raw(*filters)
 
+    def on_error(self, scope: ErrorScope = ErrorScope.GLOBAL) -> ErrorDecorator[ClientT]:
+        """Регистрирует обработчик ошибок dispatch-а и запуска клиента."""
+        return self._router.on_error(scope)
+
+    def on_disconnect(self) -> DisconnectDecorator:
+        """Регистрирует обработчик сетевого отключения перед reconnect."""
+        return self._router.on_disconnect()
+
     def include_router(self, router: Router[ClientT]) -> None:
         """Подключает дочерний router к root router клиента."""
         self._router.include_router(router)
+
+    async def relogin(self: ClientT, drop_config_token: bool = True, start: bool = True) -> None:  # noqa: PYI019
+        """Удаляет текущую локальную сессию и запускает авторизацию заново.
+
+        Args:
+            drop_config_token: Сбросить token, переданный через ``ExtraConfig``.
+            start: Сразу запустить клиента после сброса runtime.
+        """
+        store = self._app.store
+        session = self._app.session
+
+        if session is None:
+            raise RuntimeError("Cannot relogin before session is loaded")
+
+        await store.delete_session(session.token)
+        await self.close()
+
+        if drop_config_token:
+            self.extra_config.token = None
+            self._config.token = None
+
+        self._reset_runtime()
+
+        if start:
+            await self.start()

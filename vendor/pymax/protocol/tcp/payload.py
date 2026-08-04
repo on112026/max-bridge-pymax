@@ -5,7 +5,7 @@ import msgpack
 
 from pymax.logging import get_logger
 
-from .compression import Lz4BlockCompression
+from .compression import Lz4BlockCompression, ZstdCompression
 
 logger = get_logger(__name__)
 
@@ -70,9 +70,11 @@ class TcpPayloadDecoder:
         *,
         serializer: MsgpackPayloadCodec,
         compression: Lz4BlockCompression | None = None,
+        zstd_compression: ZstdCompression | None = None,
     ) -> None:
         self.serializer = serializer
         self.compression = compression
+        self.zstd_compression = zstd_compression
 
     def _normalize_keys(self, obj: Any) -> Any:
         if isinstance(obj, dict):
@@ -97,12 +99,26 @@ class TcpPayloadDecoder:
         if not payload_bytes:
             return {}
 
-        if flags & 0x03 and self.compression:
+        if flags == 0xFF:
+            if self.zstd_compression is None:
+                raise ValueError("Zstd-compressed TCP payload without a decoder")
+            try:
+                payload_bytes = self.zstd_compression.decompress(payload_bytes)
+                logger.debug("tcp payload decompressed with Zstd")
+            except ValueError:
+                logger.debug("tcp Zstd payload decompression failed", exc_info=True)
+                raise
+        elif flags > 0x7F:
+            raise ValueError(f"invalid TCP compression factor: {flags}")
+        elif flags > 0:
+            if self.compression is None:
+                raise ValueError("LZ4-compressed TCP payload without a decoder")
             try:
                 payload_bytes = self.compression.decompress(payload_bytes)
-                logger.debug("tcp payload decompressed flags=%s", flags)
+                logger.debug("tcp payload decompressed cof=%s", flags)
             except ValueError:
-                logger.debug("tcp payload decompress skipped flags=%s", flags)
+                logger.debug("tcp payload decompression failed cof=%s", flags, exc_info=True)
+                raise
 
         result = self.serializer.decode(payload_bytes)
         return self._normalize_keys(result)

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -44,6 +44,26 @@ class SendMessagePayload(CamelModel):
     chat_id: int
     message: SendMessagePayloadMessage
     notify: bool = False
+
+
+class ForwardLink(CamelModel):
+    type: Literal["FORWARD"] = "FORWARD"
+    message_id: str
+    chat_id: int
+
+
+class ForwardMessagePayloadMessage(CamelModel):
+    cid: int
+    link: ForwardLink
+    attaches: list[AttachPhotoPayload | VideoAttachPayload | AttachFilePayload] = Field(
+        default_factory=list
+    )
+
+
+class ForwardMessagePayload(CamelModel):
+    chat_id: int
+    message: ForwardMessagePayloadMessage
+    notify: bool = True
 
 
 class ChatHistoryPayload(CamelModel):

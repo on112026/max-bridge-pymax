@@ -11,4 +11,4 @@ from .presence import Presence
 from .profile import Profile
 from .session import Session
 from .sync import SyncOverrides, SyncState
-from .user import User
+from .user import ContactInfo, User

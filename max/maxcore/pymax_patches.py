@@ -1,9 +1,9 @@
-"""Monkey-patches для PyMax 2.2.0, которые не вошли в upstream.
+"""Monkey-patches для PyMax 2.3.1, которые не вошли в upstream.
 
 Зачем этот модуль
 ------------------
 
-PyMax 2.2.0 (вендор, см. ``vendor/pymax/``) содержит ряд багов в
+PyMax 2.3.1 (вендор, см. ``vendor/pymax/``) содержит ряд багов в
 обработке реакций. Все они обходятся через monkey-patches в этом
 файле. Патчи применяются **до** старта ``Client.start()``, чтобы
 перехватить и входящий, и исходящий поток данных.
@@ -29,9 +29,16 @@ PyMax 2.2.0 (вендор, см. ``vendor/pymax/``) содержит ряд ба
    в вендорном ``EVENT_MAP`` маппится в ``CHAT_UPDATE`` (а не
    ``REACTION_UPDATE``), и ``@client.on_reaction_update()`` никогда
    не срабатывает.
+ * **Patch 8**: ``User.model_validate`` coerce ``menuButton`` str → None
+   (MAX-сервер иногда возвращает menu_button как URL-строку; в PyMax
+   2.3.1 поле объявлено как ``dict | None`` — убрали ``| str``, что
+   приводит к ValidationError при разборе профиля).
 
-После того, как upstream починит соответствующие баги, все шесть
-патчей можно удалить — наш мост продолжит работать корректно.
+Патч 7 (User.gender int→str) удалён: PyMax 2.3.1 объявляет
+``gender: str | int | None``, upstream принял фикс.
+
+После того, как upstream починит соответствующие баги, все патчи
+можно удалить — наш мост продолжит работать корректно.
 
 Применение
 ----------
@@ -68,13 +75,15 @@ def apply() -> None:
     _patch_reaction_event_message_id_coerce()
     _patch_dispatcher_chat_reaction()
     _patch_app_on_event_safe()
+    _patch_user_menu_button_str()
     _APPLIED = True
     logger.info(
         "pymax_patches.apply: applied "
         "(out msgId→int, in EVENT_MAP[YOU_REACTED], "
         "in ReactionUpdateEvent.messageId coerce int→str, "
         "in Dispatcher NOTIF_CHAT→synthetic REACTION_UPDATE, "
-        "App.on_event safe, get_reactions messageIds→int)",
+        "App.on_event safe, get_reactions messageIds→int, "
+        "User.menuButton str→None)",
     )
 
 
@@ -84,7 +93,7 @@ def apply() -> None:
 
 
 def _patch_reaction_message_id_int() -> None:
-    """PyMax 2.2.0: ``messageId`` в payload реакции должен быть int.
+    """PyMax 2.3.1: ``messageId`` в payload реакции должен быть int.
 
     Обходим Pydantic-модель ``AddReactionPayload`` (где ``message_id: str``)
     и шлём payload напрямую через ``app.invoke`` с правильными типами.
@@ -183,7 +192,7 @@ def _parse_reaction_info(app, response: Any) -> Optional[Any]:
 
 
 def _patch_event_map_you_reacted() -> None:
-    """PyMax 2.2.0: ``Opcode.NOTIF_MSG_YOU_REACTED`` отсутствует в ``EVENT_MAP``.
+    """PyMax 2.3.1: ``Opcode.NOTIF_MSG_YOU_REACTED`` отсутствует в ``EVENT_MAP``.
 
     Вендорный ``mapping.EVENT_MAP`` содержит только:
         Opcode.NOTIF_MSG_REACTIONS_CHANGED → resolve_reaction_update
@@ -230,7 +239,7 @@ def _patch_event_map_you_reacted() -> None:
 
 
 def _patch_reaction_event_message_id_coerce() -> None:
-    """PyMax 2.2.0: ``ReactionUpdateEvent.message_id: str`` валит фрейм.
+    """PyMax 2.3.1: ``ReactionUpdateEvent.message_id: str`` валит фрейм.
 
     MAX-сервер шлёт в JSON ``"messageId": <int64>`` (число), а Pydantic-модель
     :class:`ReactionUpdateEvent` объявляет поле как ``str``. Pydantic 2.x
@@ -287,7 +296,7 @@ def _patch_reaction_event_message_id_coerce() -> None:
 
 
 def _patch_dispatcher_chat_reaction() -> None:
-    """PyMax 2.2.0: MAX-сервер шлёт обновления реакции через ``NOTIF_CHAT``.
+    """PyMax 2.3.1: MAX-сервер шлёт обновления реакции через ``NOTIF_CHAT``.
 
     Вендорный ``mapping.EVENT_MAP`` маппит ``Opcode.NOTIF_CHAT`` (135) на
     :func:`resolve_chat` → :attr:`EventType.CHAT_UPDATE`, а **не** на
@@ -306,7 +315,7 @@ def _patch_dispatcher_chat_reaction() -> None:
     1. До вызова ``_orig_dispatch`` проверить ``frame.opcode == NOTIF_CHAT``
        и ``frame.cmd == Command.REQUEST`` (т.е. это именно событие,
        а не ответ/ERR).
-    2. Из ``frame.payload["chat"]`` достать ``lastReactedMessageId`` /
+    2. Из ``frame.payload[\"chat\"]`` достать ``lastReactedMessageId`` /
        ``lastReaction`` (и, если есть, ``lastMessage.reactionInfo``).
     3. Сконструировать синтетический :class:`ReactionUpdateEvent` через
        ``model_validate`` (это пропустит нас через Patch 3 — coerce
@@ -534,7 +543,7 @@ def _build_synthetic_reaction_event(frame: Any) -> Optional[Any]:
 
 
 def _patch_app_on_event_safe() -> None:
-    """PyMax 2.2.0: ``App.on_event`` роняет ``RuntimeError`` при любой
+    """PyMax 2.3.1: ``App.on_event`` роняет ``RuntimeError`` при любой
     ошибке dispatcher'а и **рвёт long-poll**.
 
     Симптом в логах::
@@ -542,8 +551,7 @@ def _patch_app_on_event_safe() -> None:
         RuntimeError: Failed to dispatch inbound frame: ...
 
     Один битый фрейм (например, новая схема события реакции с
-    дополнительным полем, или ``User.gender: int`` вместо ``str`` —
-    сервер уже отдаёт такие payload-ы) валит ВСЕ последующие события,
+    дополнительным полем) валит ВСЕ последующие события,
     пока long-poll не переподключится. После реконнекта сервер может
     снова прислать тот же битый payload — и цикл повторяется.
 
@@ -603,7 +611,7 @@ def _patch_app_on_event_safe() -> None:
 
 
 def _patch_get_reactions_message_ids_int() -> None:
-    """PyMax 2.2.0: ``GetReactionsPayload.message_ids: list[str]``,
+    """PyMax 2.3.1: ``GetReactionsPayload.message_ids: list[str]``,
     но MAX-сервер ожидает ``list[int]`` (так же, как и в Patch 1).
 
     Симптом в логах::
@@ -693,3 +701,32 @@ def _patch_get_reactions_message_ids_int() -> None:
         "pymax_patches: MessageService.get_reactions → "
         "messageIds as list[int] (registered)",
     )
+
+
+# ---------------------------------------------------------------------------
+# Patch 8: User.menuButton str → None coerce
+# ---------------------------------------------------------------------------
+# PyMax 2.3.1 убрал ``| str`` из ``menu_button: dict[str, Any] | None``.
+# MAX-сервер иногда возвращает menu_button как URL-строку
+# (``https://b2bapi.max.ru/otp-web-app/index.html``), что вызывает
+# ValidationError при разборе профиля. Приводим строку к None перед валидацией.
+
+
+def _patch_user_menu_button_str() -> None:
+    from pymax.types.domain.user import User
+
+    if getattr(User.model_validate, "_pymax_patched_menu_button", False):
+        logger.debug("pymax_patches: User.model_validate already patched (menuButton), skipping")
+        return
+
+    _orig_validate = User.model_validate
+
+    @classmethod  # type: ignore[misc]
+    def _patched_validate(cls, obj, *args, **kwargs):
+        if isinstance(obj, dict) and isinstance(obj.get("menuButton"), str):
+            obj = {**obj, "menuButton": None}
+        return _orig_validate.__func__(cls, obj, *args, **kwargs)
+
+    _patched_validate._pymax_patched_menu_button = True  # type: ignore[attr-defined]
+    User.model_validate = _patched_validate
+    logger.info("pymax_patches: User.model_validate → coerce menuButton str→None (registered)")

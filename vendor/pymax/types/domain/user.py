@@ -11,6 +11,14 @@ if TYPE_CHECKING:
     from pymax.api.users.service import UserService
 
 
+class ContactInfo(CamelModel):  # TODO: move to another file
+    """Контакт телефонной книги для ``import_contacts``."""
+
+    phone: str
+    first_name: str
+    last_name: str | None = None
+
+
 class User(CamelModel):
     """Контакт или пользователь Max.
 
@@ -41,25 +49,13 @@ class User(CamelModel):
     :ivar description: Описание профиля.
     :vartype description: str | None
     :ivar gender: Пол пользователя.
-    :vartype gender: str | None
+    :vartype gender: str | int | None
     :ivar link: Ссылка на профиль.
     :vartype link: str | None
     :ivar web_app: Данные связанного web-приложения, если есть.
     :vartype web_app: dict[str, Any] | str | None
     :ivar menu_button: Данные кнопки меню профиля, если есть.
-    :vartype menu_button: dict[str, Any] | str | None
-
-    .. note::
-       ``web_app`` / ``menu_button`` объявлены как ``dict | str | None``
-       (а не чистый ``dict``), потому что MAX на свежих сессиях
-       авторизации возвращает сюда **строку-URL**
-       (``https://b2bapi.max.ru/otp-web-app/index.html``) — это
-       не наша ошибка, а реальный контракт. Без ``| str`` pydantic
-       падает с ``ValidationError: Input should be a valid dictionary
-       [type=dict_type, input_value='...', input_type=str]``, что
-       валит ``search_by_phone`` / ``add_contact`` / ``fetch_users``.
-       Бот (см. ``format_user_result``) использует ``_first_str(...)``,
-       который одинаково работает и с dict, и со str.
+    :vartype menu_button: dict[str, Any] | None
     """
 
     id: int
@@ -75,10 +71,12 @@ class User(CamelModel):
     phone: int | None = None
     status: str | None = None
     description: str | None = None
-    gender: str | None = None
+    # Bots may send ``gender`` as a numeric code and ``web_app`` as a URL
+    # string instead of an object; accept these so profile parsing won't fail.
+    gender: str | int | None = None
     link: str | None = None
     web_app: dict[str, Any] | str | None = None
-    menu_button: dict[str, Any] | str | None = None
+    menu_button: dict[str, Any] | None = None
 
     _actions: UserService | None = PrivateAttr(default=None)
 

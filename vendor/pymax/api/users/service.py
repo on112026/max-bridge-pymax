@@ -10,12 +10,13 @@ from pymax.api.response import (
 )
 from pymax.logging import get_logger
 from pymax.protocol import InboundFrame, Opcode
-from pymax.types.domain import Session, User
+from pymax.types.domain import ContactInfo, Session, User
 
 from .enums import ContactAction, UserPayloadKey
 from .payloads import (
     ContactActionPayload,
     FetchContactsPayload,
+    ImportContactsPayload,
     SearchByPhonePayload,
 )
 
@@ -121,6 +122,18 @@ class UserService:
         )
         self.app.users.pop(contact_id, None)
         return True
+
+    async def import_contacts(self, contacts: list[ContactInfo]) -> list[User]:
+        frame = ImportContactsPayload.from_contacts(contacts)
+
+        response = await self.app.invoke(Opcode.SYNC, frame.to_payload())
+
+        users = parse_payload_list(
+            response, UserPayloadKey.CONTACTS, User
+        )  # TODO: maybe also return phone mapping?
+
+        # {contacts: [...], phones: {data[0]: server_phone}}
+        return [self._cache_user(user) for user in users]
 
     def get_chat_id(self, first_user_id: int, second_user_id: int) -> int:
         return first_user_id ^ second_user_id

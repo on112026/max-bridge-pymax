@@ -23,6 +23,7 @@ from .payloads import (
     CreateGroupAttach,
     CreateGroupMessage,
     CreateGroupPayload,
+    DeleteChatPayload,
     FetchChatsPayload,
     FetchJoinRequests,
     GetChatInfoPayload,
@@ -362,3 +363,20 @@ class ChatService:
             chat_id=chat_id,
             user_ids=[user_id],
         )
+
+    async def delete_chat(
+        self,
+        chat_id: int,
+        last_event_time: int | None = None,
+        for_all: bool = True,
+    ) -> None:
+        frame = DeleteChatPayload(
+            chat_id=chat_id,
+            last_event_time=(
+                last_event_time if last_event_time is not None else int(time.time() * 1000)
+            ),
+            for_all=for_all,
+        )
+
+        await self.app.invoke(Opcode.CHAT_DELETE, frame.to_payload())
+        self._remove_cached_chat(chat_id)

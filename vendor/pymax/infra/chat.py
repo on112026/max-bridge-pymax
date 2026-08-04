@@ -227,6 +227,27 @@ class ChatMixin(IClientProtocol):
         """
         await self._app.api.chats.leave_channel(chat_id)
 
+    async def delete_chat(
+        self,
+        chat_id: int,
+        last_event_time: int | None = None,
+        for_all: bool = True,
+    ) -> None:
+        """Удаляет чат.
+
+        Args:
+            chat_id: ID чата.
+            last_event_time: Время последнего события чата. Для объекта
+                ``Chat`` это поле ``Chat.last_event_time``.
+            for_all: Удалить чат для всех участников, если сервер поддерживает
+                такой режим.
+        """
+        await self._app.api.chats.delete_chat(
+            chat_id=chat_id,
+            last_event_time=last_event_time,
+            for_all=for_all,
+        )
+
     async def fetch_chats(self, marker: int | None = None) -> list[Chat]:
         """Загружает список чатов с сервера и обновляет кеш клиента.
 

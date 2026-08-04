@@ -1,3 +1,8 @@
+from io import BytesIO
+
+import zstandard
+
+
 class Lz4BlockCompression:
     def decompress(self, src: bytes, max_output: int = 5 * 1024 * 1024) -> bytes:
         dst = bytearray()
@@ -95,3 +100,16 @@ class Lz4BlockCompression:
                 dst.extend(src[lit_start : lit_start + lit_len])
 
         return bytes(dst)
+
+
+class ZstdCompression:
+    def decompress(self, src: bytes, max_output: int = 5 * 1024 * 1024) -> bytes:
+        try:
+            with zstandard.ZstdDecompressor().stream_reader(BytesIO(src)) as reader:
+                result = reader.read(max_output + 1)
+        except zstandard.ZstdError as e:
+            raise ValueError("Zstd: failed to decompress payload") from e
+
+        if len(result) > max_output:
+            raise ValueError("Zstd: output too large")
+        return result

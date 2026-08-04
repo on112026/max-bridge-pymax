@@ -7,6 +7,7 @@ from .payload import (
     Lz4BlockCompression,
     MsgpackPayloadCodec,
     TcpPayloadDecoder,
+    ZstdCompression,
 )
 
 logger = get_logger(__name__)
@@ -20,8 +21,11 @@ class TcpProtocol(BaseProtocol):
         self.framer = TcpPacketFramer()
         self.serializer = MsgpackPayloadCodec()
         self.compression = Lz4BlockCompression()
+        self.zstd_compression = ZstdCompression()
         self.payload_decoder = TcpPayloadDecoder(
-            serializer=self.serializer, compression=self.compression
+            serializer=self.serializer,
+            compression=self.compression,
+            zstd_compression=self.zstd_compression,
         )
 
     def encode(self, frame: OutboundFrame) -> bytes:

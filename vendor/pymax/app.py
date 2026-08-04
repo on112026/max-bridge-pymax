@@ -1,12 +1,12 @@
 import asyncio
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pymax.api import ApiFacade
 from pymax.auth import AuthFlow
 from pymax.config import ClientConfig
 from pymax.connection import ConnectionManager
 from pymax.dispatch import Dispatcher
-from pymax.dispatch.router import Router
+from pymax.dispatch.router import EventType, Router
 from pymax.exceptions import ApiError
 from pymax.logging import get_logger
 from pymax.protocol import Command, InboundFrame, OutboundFrame
@@ -17,8 +17,11 @@ from pymax.telemetry import TelemetryService
 from pymax.types import MaxApiError, Message
 from pymax.types.domain import Chat, Profile, User
 
+if TYPE_CHECKING:
+    from pymax.base import BaseClient
+
 logger = get_logger(__name__)
-ClientT = TypeVar("ClientT")
+ClientT = TypeVar("ClientT", bound="BaseClient")
 
 
 class App(Generic[ClientT]):
@@ -124,9 +127,26 @@ class App(Generic[ClientT]):
         self.session = session_data
 
         logger.debug("logging in")
-        response = await self.api.auth.login(
-            self.config.device.user_agent,
-        )
+
+        try:
+            response = await self.api.auth.login(
+                self.config.device.user_agent,
+            )
+        except Exception as e:
+            handled = False
+            if self.dispatcher.client is not None:
+                handled = await self.dispatcher.emit_error(
+                    e,
+                    EventType.ON_START,
+                    None,
+                    self.dispatcher.root_router,
+                    None,
+                )
+            if not handled:
+                raise
+
+            await self.close()
+            return
 
         if response.token is not None and response.token != self.session.token:
             await self.store.update_token(self.session.token, response.token)

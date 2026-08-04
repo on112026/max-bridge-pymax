@@ -19,11 +19,19 @@ from pymax.types.events import (
 from .enums import EventType
 from .mapping import EventMapper, EventResolver
 from .router import (
+    DisconnectCallback,
+    DisconnectDecorator,
+    ErrorContext,
+    ErrorDecorator,
+    ErrorEntry,
+    ErrorScope,
+    ErrorSource,
     FilterCallback,
     HandlerCallback,
     HandlerDecorator,
     HandlerEntry,
     Router,
+    StartCallback,
     StartDecorator,
 )
 
@@ -31,11 +39,12 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from pymax.app import App
+    from pymax.base import BaseClient
 
 
 logger = get_logger(__name__)
 
-ClientT = TypeVar("ClientT")
+ClientT = TypeVar("ClientT", bound="BaseClient")
 
 
 class Dispatcher(Generic[ClientT]):
@@ -77,6 +86,13 @@ class Dispatcher(Generic[ClientT]):
     ) -> HandlerDecorator[Any, ClientT]:
         logger.debug("registering handler event=%s filters=%s", event, len(filters))
         return self.root_router.on(event, *filters)
+
+    def on_error(self, scope: ErrorScope = ErrorScope.GLOBAL) -> ErrorDecorator[ClientT]:
+        return self.root_router.on_error(scope)
+
+    def on_disconnect(self) -> DisconnectDecorator:
+        """Регистрирует обработчик сетевого отключения на root router."""
+        return self.root_router.on_disconnect()
 
     def on_message(
         self,
@@ -146,22 +162,62 @@ class Dispatcher(Generic[ClientT]):
         for child in router.children:
             yield from self._iter_router(child)
 
+    def iter_error_entries(
+        self,
+    ) -> Generator[tuple[Router[ClientT], ErrorEntry[ClientT]], Any, None]:
+        for router in self.iter_routers():
+            for entry in router.error_handlers:
+                yield router, entry
+
+    def iter_disconnect_handlers(self) -> Generator[DisconnectCallback, Any, None]:
+        """Итерирует обработчики disconnect по root router и его детям."""
+        for router in self.iter_routers():
+            yield from router.disconnect_handlers
+
+    def iter_error_handlers(
+        self,
+        failed_router: Router[ClientT],
+    ) -> Generator[ErrorEntry[ClientT], Any, None]:
+        for owner_router, entry in self.iter_error_entries():
+            if entry.scope is ErrorScope.LOCAL and owner_router is not failed_router:
+                continue
+
+            yield entry
+
     async def emit_start(self, client: ClientT) -> None:
         tasks: list[asyncio.Task[Any]] = []
 
-        for router in self.iter_routers():
-            handler = router.on_start_handler
-            if handler is None:
-                continue
-
-            result = handler(client)
-
-            if inspect.iscoroutine(result):
-                task = asyncio.create_task(result)
+        for router in self.iter_routers():  # TODO: create iter_on_start_handlers
+            for handler in router.on_start_handlers:
+                task = asyncio.create_task(self._run_start_handler(router, handler, client))
                 task.add_done_callback(_log_task_error)
                 tasks.append(task)
 
-        self.startup_tasks = tasks
+        self.startup_tasks.extend(tasks)
+
+    async def _run_start_handler(
+        self,
+        router: Router[ClientT],
+        handler: StartCallback[ClientT],
+        client: ClientT,
+    ) -> None:
+        try:
+            result = handler(client)
+
+            if inspect.isawaitable(result):
+                await result
+
+        except Exception as e:
+            handled = await self.emit_error(
+                e,
+                EventType.ON_START,
+                None,
+                router,
+                handler,
+            )
+
+            if not handled:
+                raise
 
     async def stop_startup_tasks(self) -> None:
         if not self.startup_tasks:
@@ -201,13 +257,18 @@ class Dispatcher(Generic[ClientT]):
         event: Any,
     ) -> None:
         for entry in router.handlers.get(event_type, []):
-            if await self._matches(entry, event):
-                logger.debug(
-                    "calling handler event=%s callback=%s",
-                    event_type,
-                    _callback_name(entry.callback),
-                )
-                await self._call(entry.callback, event)
+            try:
+                if await self._matches(entry, event):
+                    logger.debug(
+                        "calling handler event=%s callback=%s",
+                        event_type,
+                        _callback_name(entry.callback),
+                    )
+                    await self._call(entry.callback, event)
+            except Exception as e:  # noqa: PERF203
+                handled = await self.emit_error(e, event_type, event, router, entry)
+                if not handled:
+                    raise
 
         for child in router.children:
             await self._dispatch_to_router(child, event_type, event)
@@ -239,6 +300,63 @@ class Dispatcher(Generic[ClientT]):
             return await result
 
         return result
+
+    async def emit_error(
+        self,
+        exception: Exception,
+        event_type: EventType,
+        event: Any,
+        router: Router[ClientT],
+        handler: ErrorSource[ClientT] | None,
+    ) -> bool:
+        client = self.client
+        handled = False
+
+        if client is None:
+            raise RuntimeError("client is not bound to dispatcher")
+
+        ctx = ErrorContext[ClientT](
+            client=client,
+            event_type=event_type,
+            event=event,
+            router=router,
+            handler=handler,
+        )
+        for entry in self.iter_error_handlers(router):
+            handled = True
+            try:
+                result = entry.callback(exception, ctx)
+
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.exception("Error while error handling: %s", e)
+                return False
+
+        return handled
+
+    async def emit_disconnect(
+        self,
+        exception: Exception,
+        reconnect: bool,
+        delay: float,
+    ) -> None:
+        """Вызывает обработчики потери соединения.
+
+        Ошибки внутри disconnect-handler-ов логируются и не прерывают reconnect.
+        """
+
+        if self.client is None:
+            raise RuntimeError("client is not bound to dispatcher")
+
+        for handler in self.iter_disconnect_handlers():
+            try:
+                result = handler(exception, reconnect, delay)
+
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.exception("Error during disconnect handling: %s", e)
 
 
 def _callback_name(callback: Any) -> str:

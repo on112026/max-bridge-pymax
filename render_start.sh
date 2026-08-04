@@ -73,6 +73,17 @@ else
     echo "[render_start] RENDER_SERVICE_URL not set — keep-alive disabled"
 fi
 
-# --- 4. Запуск ---
+# --- 4. Задержка перед запуском (только на Render) ---
+# Render при деплое поднимает новый контейнер до того как убивает старый.
+# Это вызывает TelegramConflictError — два экземпляра бота одновременно
+# делают getUpdates. Ждём 15 секунд — за это время старый контейнер
+# получает SIGTERM и завершается, конфликта нет.
+STARTUP_DELAY="${RENDER_STARTUP_DELAY:-15}"
+if [ "$STARTUP_DELAY" -gt 0 ] 2>/dev/null; then
+    echo "[render_start] waiting ${STARTUP_DELAY}s for old container to shut down..."
+    sleep "$STARTUP_DELAY"
+fi
+
+# --- 5. Запуск ---
 echo "[render_start] starting run_all.py..."
 exec python3 /app/run_all.py

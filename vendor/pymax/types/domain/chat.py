@@ -20,7 +20,7 @@ class Chat(CamelModel):
     Объекты чатов, полученные через клиент, обычно уже привязаны к сервисам
     сообщений и чатов. После этого можно вызывать удобные методы объекта:
     :meth:`answer`, :meth:`history`, :meth:`get_message`,
-    :meth:`get_messages`, :meth:`leave`, :meth:`invite`,
+    :meth:`get_messages`, :meth:`leave`, :meth:`delete`, :meth:`invite`,
     :meth:`remove_users`, :meth:`pin_message`, :meth:`update_settings` и
     :meth:`rework_invite_link`.
 
@@ -304,6 +304,26 @@ class Chat(CamelModel):
             return await chat_actions.leave_channel(self.id)
 
         raise ValueError("Unknown chat type=%s", self.type)
+
+    async def delete(self, *, for_all: bool = True) -> None:
+        """Удаляет этот чат.
+
+        Для ``last_event_time`` используется значение ``Chat.last_event_time``.
+
+        :param for_all: Удалить чат для всех участников, если сервер
+            поддерживает такой режим.
+        :type for_all: bool
+        :returns: ``None``.
+        :rtype: None
+        :raises RuntimeError: Если чат не привязан к клиенту.
+        """
+        _, chat_actions = self._bound()
+
+        return await chat_actions.delete_chat(
+            self.id,
+            last_event_time=self.last_event_time,
+            for_all=for_all,
+        )
 
     async def invite(
         self,
